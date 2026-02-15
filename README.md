@@ -53,7 +53,7 @@ This means:
 2.  **Open Source Obligation**: If you run a network service (like a Telegram Bot) based on this project, you **must** disclose your full source code to all users.
 3.  **No Closed-Source Commercialization**: Any unauthorized commercial modification, deployment, or operation is an infringement.
 
-Copyright © 2024 Ryan (bestian830). All Rights Reserved.
+Copyright © 2026 Ryan (bestian830). All Rights Reserved.
 
 ---
 
