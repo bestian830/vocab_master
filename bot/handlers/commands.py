@@ -20,11 +20,12 @@ from database.client import (
     get_all_vocab, get_user_settings, set_user_timezone,
     get_streak, check_db_connection,
     get_all_user_ids, get_admin_stats, get_vocab_detail,
+    has_user_settings,
 )
 from config import ADMIN_TELEGRAM_ID, FREE_WORD_LIMIT, FREE_DAILY_LIMIT
 from core.quiz import build_quiz
 from core.sm2 import level_description
-from bot.keyboards import quiz_keyboard, vocab_page_keyboard, delete_confirm_keyboard, timezone_keyboard, vocab_detail_keyboard
+from bot.keyboards import quiz_keyboard, vocab_page_keyboard, delete_confirm_keyboard, timezone_keyboard, vocab_detail_keyboard, settings_panel_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ _HELP_TEXT = (
     "/update <词> — 编辑词汇的词性/释义/例句\n"
     "/delete <词> — 从词库删除单词\n"
     "/timezone — 设置复习提醒时区\n"
+    "/settings — 通知设置（时段/开关）\n"
     "/plan — 查看订阅状态\n"
     "/activate <码> — 激活订阅\n"
     "/help — 显示此帮助信息"
@@ -86,7 +88,7 @@ def _vocab_line(r: dict) -> str:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start — 欢迎消息 + 使用说明"""
+    """/start — 欢迎消息 + 使用说明；新用户自动引导时区设置"""
     text = (
         "👋 欢迎使用 *Vocab Master*！\n\n"
         "我能帮你记住英文单词，使用艾宾浩斯遗忘曲线自动安排复习。\n\n"
@@ -97,6 +99,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         + _HELP_TEXT
     )
     await update.message.reply_text(text, parse_mode="Markdown")
+
+    # 新用户自动弹出时区设置（老用户不重复打扰）
+    telegram_id = str(update.effective_user.id)
+    if not has_user_settings(telegram_id):
+        await update.message.reply_text(
+            "🌏 先设置时区，以便正确安排复习提醒：",
+            reply_markup=timezone_keyboard(),
+        )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,13 +162,26 @@ async def cmd_streak(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_practice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/practice — 直接进入练习模式，不受 next_review 限制"""
     telegram_id = str(update.effective_user.id)
+
+    # 防止多开：有活跃会话时拦截
+    active = context.user_data.get("active_session")
+    if active:
+        mode_label = "复习" if active == "review" else "练习"
+        await update.message.reply_text(
+            f"⏳ 你正在进行{mode_label}，先完成当前题目吧～\n"
+            f"（点击题目下方的「结束」按钮可提前结束）"
+        )
+        return
+
     total = count_vocab(telegram_id)
     if total == 0:
         await update.message.reply_text("词库还是空的～先发送单词积累吧！")
         return
+    context.user_data["active_session"] = "practice"
     await update.message.reply_text("🎮 进入练习模式（答题不计入复习进度）…")
     question = await build_quiz(telegram_id, practice_mode=True)
     if not question:
+        context.user_data.pop("active_session", None)
         await update.message.reply_text("生成练习题时出错，请稍后重试。")
         return
     await _send_quiz(update.message.reply_text, question)
@@ -203,6 +226,16 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """/review — 手动触发一道复习题"""
     telegram_id = str(update.effective_user.id)
 
+    # 防止多开：有活跃会话时拦截
+    active = context.user_data.get("active_session")
+    if active:
+        mode_label = "复习" if active == "review" else "练习"
+        await update.message.reply_text(
+            f"⏳ 你正在进行{mode_label}，先完成当前题目吧～\n"
+            f"（点击题目下方的「结束」按钮可提前结束）"
+        )
+        return
+
     # 检查是否有到期词汇
     due_list = get_due_vocab(telegram_id)
     if not due_list:
@@ -213,21 +246,25 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
             return
         # 有词汇但无到期 → 自动进入练习模式
+        context.user_data["active_session"] = "practice"
         await update.message.reply_text(
             "⏳ 当前无到期词汇，进入练习模式（答题不计入复习进度）…"
         )
         question = await build_quiz(telegram_id, practice_mode=True)
         if not question:
+            context.user_data.pop("active_session", None)
             await update.message.reply_text("生成复习题时出错，请稍后重试。")
             return
         await _send_quiz(update.message.reply_text, question)
         return
 
     # 生成正式复习题
+    context.user_data["active_session"] = "review"
     await update.message.reply_text("⏳ 正在生成复习题…")
     question = await build_quiz(telegram_id)
 
     if not question:
+        context.user_data.pop("active_session", None)
         await update.message.reply_text("生成复习题时出错，请稍后重试。")
         return
 
@@ -751,6 +788,32 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"*调度器：* {sched_status}"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/settings — 通知推送偏好面板（时段/开关）"""
+    telegram_id = str(update.effective_user.id)
+    settings = get_user_settings(telegram_id)
+
+    tz = settings.get("timezone", "UTC")
+    start_h = settings.get("remind_start", 8)
+    end_h = settings.get("remind_end", 22)
+    enabled = settings.get("remind_enabled", True)
+
+    enabled_label = "✅ 开启" if enabled else "❌ 关闭"
+    toggle_label = "🔕 关闭推送" if enabled else "🔔 开启推送"
+
+    text = (
+        f"🔔 *通知设置*\n\n"
+        f"🌏 时区：`{tz}`（用 /timezone 修改）\n"
+        f"⏰ 推送时段：{start_h:02d}:00 – {end_h:02d}:00\n"
+        f"📢 自动复习推送：{enabled_label}"
+    )
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=settings_panel_keyboard(toggle_label),
+    )
 
 
 async def _send_quiz(send_fn, question) -> None:

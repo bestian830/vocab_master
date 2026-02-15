@@ -203,23 +203,72 @@ async def analyze_sentence(sentence: str) -> tuple[str, list[ParsedVocab]]:
     return translation, vocabs
 
 
+async def generate_example_sentence(word: str, definition: str) -> str:
+    """为单词生成一条自然的英文例句（不含填空符，用于答错无例句时补充语境）"""
+    prompt = (
+        f'Word: "{word}" ({definition})\n'
+        f"Write one natural English example sentence using this word. Output only the sentence."
+    )
+    resp = await _ai_client.chat.completions.create(
+        model=AI_MODEL,
+        messages=[
+            {"role": "system", "content": "你是英语词汇教学助手，只输出例句，不输出其他内容。"},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=80,
+        temperature=0.7,
+    )
+    return resp.choices[0].message.content.strip()
+
+
 async def generate_quiz_sentence(word: str, definition: str) -> str:
     """
     为复习测验生成一个新的填空例句（不同于入库时的 context）。
     返回含 ___ 占位符的英文句子。
+    使用全英文 prompt + few-shot 示例，防止 AI 把"步骤/填空"写进句子。
     """
     prompt = (
-        f"请直接输出一句将短语/单词 '{word}'（{definition}）整体替换为 ___ 的英文填空例句。"
-        f"重要：必须将 '{word}' 的全部单词作为一个整体全部替换为单个 ___，"
-        f"替换后句中不能再出现 '{word}' 里的任何实义词。只输出这一句填空句，不要任何解释。"
+        f"Create a fill-in-the-blank sentence for the word/phrase: '{word}' ({definition}).\n"
+        f"Instructions:\n"
+        f"1. Write a natural English sentence that contains the exact phrase '{word}' "
+        f"(do NOT change any word in the phrase, including pronouns or articles).\n"
+        f"2. Replace the entire phrase '{word}' with exactly six underscores: ______\n"
+        f"3. Output ONLY the fill-in-the-blank sentence. No explanations, no parentheses.\n"
+        f"Example: For 'give up' → output: Don't ______ just because it's hard.\n"
+        f"Example: For 'your enthusiasm' → output: Her teacher praised ______ during the presentation.\n"
+        f"Important: The word/phrase '{word}' must NOT appear anywhere in the output."
     )
     response = await _ai_client.chat.completions.create(
         model=AI_MODEL,
         messages=[
-            {"role": "system", "content": "你是英语词汇教学助手，只输出例句。"},
+            {"role": "system", "content": "You are an English vocabulary teaching assistant. Output only the fill-in-the-blank sentence."},
             {"role": "user", "content": prompt},
         ],
         temperature=0.7,
+        max_tokens=100,
+    )
+    result = response.choices[0].message.content.strip()
+
+    # 若 AI 没有正确生成占位符，手动将原词替换为 ______
+    if "___" not in result:
+        import re as _re
+        result = _re.sub(_re.escape(word), "______", result, count=1, flags=_re.IGNORECASE)
+        # 最终兜底：若仍无占位符则返回通用句
+        if "___" not in result:
+            result = f"She demonstrated ______ in her daily work."
+
+    return result
+
+
+async def translate_to_chinese(sentence: str) -> str:
+    """将英文例句翻译为中文，用于答错反馈"""
+    response = await _ai_client.chat.completions.create(
+        model=AI_MODEL,
+        messages=[
+            {"role": "system", "content": "你是翻译助手，只输出中文翻译，不加任何解释。"},
+            {"role": "user", "content": f"请将以下英文翻译成中文：\n{sentence}"},
+        ],
+        temperature=0.3,
         max_tokens=100,
     )
     return response.choices[0].message.content.strip()

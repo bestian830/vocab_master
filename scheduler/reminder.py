@@ -53,6 +53,12 @@ async def _push_reviews(bot: Bot) -> None:
     for user in users:
         telegram_id = user["telegram_id"]
         try:
+            # 检查用户是否开启了推送
+            settings = get_user_settings(telegram_id)
+            if not settings.get("remind_enabled", True):
+                logger.debug("用户 %s 已关闭推送，跳过", telegram_id)
+                continue
+
             # 检查用户本地时间是否在提醒窗口内
             if not _is_in_remind_window(telegram_id):
                 logger.debug("用户 %s 不在提醒时间窗口内，跳过", telegram_id)

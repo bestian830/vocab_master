@@ -9,7 +9,7 @@ import random
 import logging
 from dataclasses import dataclass
 
-from ai.parser import generate_quiz_sentence
+from ai.parser import generate_quiz_sentence, generate_example_sentence
 from database.client import get_due_vocab, get_practice_vocab, get_random_words_for_distractor
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ async def build_quiz(telegram_id: str, practice_mode: bool = False) -> QuizQuest
     if quiz_type == "fill":
         return await _build_fill_quiz(target, record_id, word, definition, distractors_raw, practice_mode)
     else:
-        return _build_meaning_quiz(target, record_id, word, definition, distractors_raw, practice_mode)
+        return await _build_meaning_quiz(target, record_id, word, definition, distractors_raw, practice_mode)
 
 
 async def _build_fill_quiz(
@@ -144,6 +144,10 @@ async def _build_fill_quiz(
     random.shuffle(options)
     correct_index = options.index(word)
 
+    # 若占位符在句首，选项首字母大写（视觉匹配句子首位置）
+    if sentence.startswith("______"):
+        options = [opt[0].upper() + opt[1:] if opt else opt for opt in options]
+
     return QuizQuestion(
         record_id=record_id,
         word=word,
@@ -157,7 +161,7 @@ async def _build_fill_quiz(
     )
 
 
-def _build_meaning_quiz(
+async def _build_meaning_quiz(
     target: dict,
     record_id: str,
     word: str,
@@ -166,10 +170,16 @@ def _build_meaning_quiz(
     practice_mode: bool = False,
 ) -> QuizQuestion:
     """
-    构建选义题：使用入库时的 context 作例句，4个中文释义选项
+    构建选义题：AI 生成新例句（不含占位符），4个中文释义选项
     """
-    # 直接使用入库时的例句，无需额外 AI 调用
-    sentence = target.get("context") or f"She used the word {word} in her speech."
+    # 调用 AI 生成多样化例句，展示单词在真实语境中的用法
+    try:
+        sentence = await generate_example_sentence(word, definition)
+        if not sentence:
+            raise ValueError("empty response")
+    except Exception as exc:
+        logger.warning("选义题生成例句失败，使用入库 context: %s", exc)
+        sentence = target.get("context") or f"She used the word {word} in her speech."
 
     # 从干扰项中取 definition 作混淆选项
     fallback_definitions = [

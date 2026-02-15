@@ -48,8 +48,9 @@ CREATE TABLE IF NOT EXISTS activation_codes (
 CREATE TABLE IF NOT EXISTS user_settings (
   telegram_id       text  PRIMARY KEY,
   timezone          text  NOT NULL DEFAULT 'UTC',     -- IANA 时区名，如 Asia/Shanghai
-  remind_start      int   NOT NULL DEFAULT 8,          -- 推送开始小时（本地时间，0-23）
-  remind_end        int   NOT NULL DEFAULT 22,          -- 推送结束小时（本地时间，0-23）
+  remind_start      int     NOT NULL DEFAULT 8,         -- 推送开始小时（本地时间，0-23）
+  remind_end        int     NOT NULL DEFAULT 22,        -- 推送结束小时（本地时间，0-23）
+  remind_enabled    boolean NOT NULL DEFAULT TRUE,      -- 是否开启自动复习推送
   streak_days       int   NOT NULL DEFAULT 0,           -- 连续学习天数
   last_active_date  date,                               -- 最后一次有复习操作的日期（UTC）
   updated_at        timestamptz NOT NULL DEFAULT now()
@@ -59,3 +60,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
 ALTER TABLE user_settings
   ADD COLUMN IF NOT EXISTS streak_days      INT  NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS last_active_date DATE;
+
+-- 新增 remind_enabled 字段（已有库执行此语句）
+ALTER TABLE user_settings
+  ADD COLUMN IF NOT EXISTS remind_enabled BOOLEAN NOT NULL DEFAULT TRUE;

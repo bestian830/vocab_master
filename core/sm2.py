@@ -1,41 +1,67 @@
 """
-SM-2 简化版：硬编码 8 级时间表
-MVP 阶段不使用动态 ease_factor，该字段保留供后续迭代使用。
+SM-2 升级版：3种答题结果 + 动态 ease_factor 调整间隔
 
-级别与复习间隔对应关系（从 level 0 答对后进入下一级）：
-  level 0 → 答对后 +1天   答错 → 回到 level 0
-  level 1 → 答对后 +2天
-  level 2 → 答对后 +4天
-  level 3 → 答对后 +7天
-  level 4 → 答对后 +14天
-  level 5 → 答对后 +30天
-  level 6 → 答对后 +90天
-  level 7 → 已"掌握"，停止复习（next_review 设为 10 年后）
+答题结果：
+  correct — 答对：升1级，EF 小增，间隔 = base * ef/2.5
+  fuzzy   — 模糊/跳过：级别不变，EF 小降，明天再复习
+  wrong   — 答错：降1级（不归零），EF 较大降，明天再复习
+
+EF 范围 1.3–3.0，初始 2.5
+间隔基准表 [1,2,4,7,14,30,90,3650] 天（索引 = 级别）
 """
 from datetime import datetime, timedelta, timezone
 
-# 每个级别答对后距下次复习的天数
+# 每个级别答对后的基准间隔天数（索引 = 级别 0-7）
 _INTERVALS_DAYS: list[int] = [1, 2, 4, 7, 14, 30, 90, 3650]
 
+# EF 初始值与边界
+_EF_DEFAULT = 2.5
+_EF_MIN = 1.3
+_EF_MAX = 3.0
 
-def next_level_and_review(current_level: int, correct: bool) -> tuple[int, datetime]:
+
+def next_level_and_review(
+    current_level: int,
+    current_ef: float,
+    result: str,  # "correct" | "fuzzy" | "wrong"
+) -> tuple[int, float, datetime]:
     """
-    根据当前级别和作答是否正确，返回 (新级别, 下次复习时间)。
+    根据当前级别、ease_factor 和答题结果，返回 (新级别, 新EF, 下次复习时间)。
 
     :param current_level: 当前 level（0-7）
-    :param correct: True=答对，False=答错
-    :return: (new_level, next_review_utc)
+    :param current_ef:    当前 ease_factor（1.3-3.0）
+    :param result:        答题结果，"correct"/"fuzzy"/"wrong"
+    :return: (new_level, new_ef, next_review_utc)
     """
-    if correct:
-        # 答对：升一级（最高 7）
+    # 级别更新
+    if result == "correct":
         new_level = min(current_level + 1, 7)
+    elif result == "wrong":
+        # 降1级，最低回 0
+        new_level = max(0, current_level - 1)
     else:
-        # 答错：退回 level 0，明天重新复习
-        new_level = 0
+        # fuzzy：级别不变
+        new_level = current_level
 
-    interval_days = _INTERVALS_DAYS[new_level]
-    next_review = datetime.now(tz=timezone.utc) + timedelta(days=interval_days)
-    return new_level, next_review
+    # EF 更新
+    if result == "correct":
+        new_ef = min(_EF_MAX, current_ef + 0.1)
+    elif result == "fuzzy":
+        new_ef = max(_EF_MIN, current_ef - 0.15)
+    else:  # wrong
+        new_ef = max(_EF_MIN, current_ef - 0.3)
+
+    # 间隔计算
+    if result == "correct":
+        # 答对：基准间隔 × (ef / 2.5)，EF 越高间隔越长
+        base_interval = _INTERVALS_DAYS[new_level]
+        interval = max(1, round(base_interval * new_ef / _EF_DEFAULT))
+    else:
+        # 模糊/答错：固定明天复习
+        interval = 1
+
+    next_review = datetime.now(tz=timezone.utc) + timedelta(days=interval)
+    return new_level, new_ef, next_review
 
 
 def format_next_review(dt: datetime) -> str:

@@ -196,6 +196,45 @@ def edit_field_keyboard(record_id: str, field: str, page: int) -> InlineKeyboard
     return InlineKeyboardMarkup([row])
 
 
+def settings_panel_keyboard(toggle_label: str) -> InlineKeyboardMarkup:
+    """
+    通知设置主面板键盘：更改时段 + 开关推送
+    toggle_label: "🔕 关闭推送" 或 "🔔 开启推送"
+    """
+    row1 = [InlineKeyboardButton("⏰ 更改时段", callback_data="settings:window")]
+    row2 = [InlineKeyboardButton(toggle_label, callback_data="settings:toggle")]
+    return InlineKeyboardMarkup([row1, row2])
+
+
+def remind_window_keyboard() -> InlineKeyboardMarkup:
+    """
+    推送时段选择面板：5 种预设 + 返回按钮
+    callback_data 格式：settings:set_win:{start}:{end}
+    """
+    options = [
+        ("06:00–22:00", 6, 22),
+        ("07:00–23:00", 7, 23),
+        ("08:00–22:00", 8, 22),
+        ("09:00–21:00", 9, 21),
+        ("全天（00:00–24:00）", 0, 24),
+    ]
+    rows = []
+    # 前4个两两一行
+    for i in range(0, 4, 2):
+        row = [
+            InlineKeyboardButton(options[i][0], callback_data=f"settings:set_win:{options[i][1]}:{options[i][2]}"),
+            InlineKeyboardButton(options[i+1][0], callback_data=f"settings:set_win:{options[i+1][1]}:{options[i+1][2]}"),
+        ]
+        rows.append(row)
+    # 第5个独占一行
+    rows.append([
+        InlineKeyboardButton(options[4][0], callback_data=f"settings:set_win:{options[4][1]}:{options[4][2]}"),
+    ])
+    # 返回按钮
+    rows.append([InlineKeyboardButton("← 返回", callback_data="settings:back")])
+    return InlineKeyboardMarkup(rows)
+
+
 def timezone_keyboard() -> InlineKeyboardMarkup:
     """
     时区选择键盘，每行2个按钮，callback_data = tz:{IANA_timezone}

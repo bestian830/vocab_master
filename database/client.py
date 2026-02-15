@@ -135,8 +135,14 @@ def count_vocab(telegram_id: str) -> int:
     return result.count or 0
 
 
-def update_vocab_after_review(record_id: str, level: int, next_review_iso: str, telegram_id: str | None = None) -> None:
-    """复习后更新 level、next_review，并将 review_count +1；同步更新连续学习天数"""
+def update_vocab_after_review(
+    record_id: str,
+    level: int,
+    next_review_iso: str,
+    ease_factor: float | None = None,
+    telegram_id: str | None = None,
+) -> None:
+    """复习后更新 level、next_review、ease_factor，并将 review_count +1；同步更新连续学习天数"""
     db = get_client()
     # 先取当前 review_count 和 telegram_id（若未传入则从记录中读取）
     row = (
@@ -148,13 +154,15 @@ def update_vocab_after_review(record_id: str, level: int, next_review_iso: str, 
         .data
     )
     current_count = row["review_count"] if row else 0
-    db.table("vocab_records").update(
-        {
-            "level": level,
-            "next_review": next_review_iso,
-            "review_count": current_count + 1,
-        }
-    ).eq("id", record_id).execute()
+    update_dict: dict = {
+        "level": level,
+        "next_review": next_review_iso,
+        "review_count": current_count + 1,
+    }
+    # 若提供了新 ease_factor，一并更新
+    if ease_factor is not None:
+        update_dict["ease_factor"] = ease_factor
+    db.table("vocab_records").update(update_dict).eq("id", record_id).execute()
 
     # 更新连续学习天数
     tid = telegram_id or (row.get("telegram_id") if row else None)
@@ -422,13 +430,13 @@ def get_vocab_detail(record_id: str) -> dict | None:
 def get_user_settings(telegram_id: str) -> dict:
     """
     获取用户设置，不存在或表不存在时返回默认值（静默处理）。
-    返回字段: timezone, remind_start, remind_end
+    返回字段: timezone, remind_start, remind_end, remind_enabled
     """
     db = get_client()
     try:
         rows = (
             db.table("user_settings")
-            .select("timezone,remind_start,remind_end")
+            .select("timezone,remind_start,remind_end,remind_enabled")
             .eq("telegram_id", telegram_id)
             .limit(1)
             .execute()
@@ -436,10 +444,61 @@ def get_user_settings(telegram_id: str) -> dict:
         )
     except Exception:
         # 表不存在（PGRST205）或其他错误时静默降级
-        return {"timezone": "UTC", "remind_start": 8, "remind_end": 22}
+        return {"timezone": "UTC", "remind_start": 8, "remind_end": 22, "remind_enabled": True}
     if rows:
-        return rows[0]
-    return {"timezone": "UTC", "remind_start": 8, "remind_end": 22}
+        # remind_enabled 字段可能尚未存在（旧数据库），降级为 True
+        row = rows[0]
+        row.setdefault("remind_enabled", True)
+        return row
+    return {"timezone": "UTC", "remind_start": 8, "remind_end": 22, "remind_enabled": True}
+
+
+def has_user_settings(telegram_id: str) -> bool:
+    """判断用户是否已有 user_settings 记录（用于新用户检测）"""
+    db = get_client()
+    try:
+        rows = (
+            db.table("user_settings")
+            .select("telegram_id")
+            .eq("telegram_id", telegram_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        return bool(rows)
+    except Exception:
+        return False
+
+
+def update_remind_window(telegram_id: str, start_h: int, end_h: int) -> None:
+    """upsert 用户推送时段（remind_start/remind_end）"""
+    db = get_client()
+    try:
+        db.table("user_settings").upsert(
+            {
+                "telegram_id": telegram_id,
+                "remind_start": start_h,
+                "remind_end": end_h,
+            },
+            on_conflict="telegram_id",
+        ).execute()
+    except Exception as exc:
+        raise RuntimeError("user_settings 表不存在") from exc
+
+
+def set_remind_enabled(telegram_id: str, enabled: bool) -> None:
+    """upsert remind_enabled 字段，控制是否接收自动推送"""
+    db = get_client()
+    try:
+        db.table("user_settings").upsert(
+            {
+                "telegram_id": telegram_id,
+                "remind_enabled": enabled,
+            },
+            on_conflict="telegram_id",
+        ).execute()
+    except Exception as exc:
+        raise RuntimeError("user_settings 表不存在") from exc
 
 
 def update_streak(telegram_id: str) -> None:
