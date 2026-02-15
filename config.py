@@ -21,6 +21,10 @@ AI_MODEL: str = os.getenv("AI_MODEL", "deepseek-chat")
 # 调度器
 SCHEDULER_INTERVAL_MINUTES: int = int(os.getenv("SCHEDULER_INTERVAL_MINUTES", "60"))
 
+# 部署模式：设置了 WEBHOOK_URL 则用 webhook，否则用 polling
+PORT: int = int(os.getenv("PORT", "8443"))
+WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "")   # 例：https://xxx.koyeb.app
+
 # 订阅系统
 ADMIN_TELEGRAM_ID: str = os.getenv("ADMIN_TELEGRAM_ID", "")
 FREE_WORD_LIMIT: int = 300

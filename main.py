@@ -14,7 +14,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import TELEGRAM_BOT_TOKEN
+from config import TELEGRAM_BOT_TOKEN, PORT, WEBHOOK_URL
 from bot.handlers.commands import (
     cmd_start, cmd_help, cmd_vocab, cmd_review, cmd_practice, cmd_streak,
     cmd_activate, cmd_plan, cmd_gencode, cmd_extend, cmd_stats,
@@ -93,16 +93,19 @@ def main() -> None:
     app.bot_data["scheduler"] = scheduler   # 供 /health 访问
     logger.info("APScheduler 已启动")
 
-    # ── 启动 Bot（Polling 模式） ───────────────────────────────────────────────
-    # 生产环境请切换为 webhook：
-    #   app.run_webhook(
-    #       listen="0.0.0.0",
-    #       port=8443,
-    #       url_path=TELEGRAM_BOT_TOKEN,
-    #       webhook_url=f"https://your-domain.com/{TELEGRAM_BOT_TOKEN}",
-    #   )
-    logger.info("Bot 启动中（Polling 模式）…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # ── 启动 Bot（自动判断模式） ───────────────────────────────────────────────
+    # 本地开发不设 WEBHOOK_URL → polling；Koyeb 上设了 WEBHOOK_URL → webhook
+    if WEBHOOK_URL:
+        logger.info("Bot 启动中（Webhook 模式）…")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_BOT_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_BOT_TOKEN}",
+        )
+    else:
+        logger.info("Bot 启动中（Polling 模式）…")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
