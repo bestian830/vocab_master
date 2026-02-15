@@ -1,167 +1,70 @@
 # Vocab Master
 
-一个基于 Telegram 的英语词汇记忆 Bot，利用**艾宾浩斯遗忘曲线**（SM-2 算法）自动安排复习，让单词真正记住而不是背了忘、忘了背。
+![License](https://img.shields.io/badge/license-AGPLv3-blue.svg) ![Python](https://img.shields.io/badge/python-3.11+-green.svg) ![Status](https://img.shields.io/badge/status-active-success.svg)
 
-> 截图占位：_（待补充）_
+> **Note: This project is a personal portfolio showcase. The core service logic and data models have been optimized for a specific cloud environment. Unauthorized commercial deployment or redistribution is strictly prohibited.**
 
----
-
-## 功能概览
-
-### 用户命令
-
-| 命令 | 说明 |
-|------|------|
-| `/start` | 欢迎消息 + 使用说明 |
-| `/vocab` | 分页浏览词库（支持 Inline 翻页） |
-| `/review` | 手动触发一道复习题 |
-| `/plan` | 查看订阅状态与词库统计 |
-| `/activate <码>` | 激活 Pro 订阅码 |
-
-### 管理员命令
-
-| 命令 | 说明 |
-|------|------|
-| `/gencode <天数> <数量>` | 批量生成激活码（最多 50 个） |
-| `/extend <telegram_id> <天数>` | 直接为指定用户续期 |
-
-### 使用流程
-
-1. **添加词汇**
-   - 发送单词：`devastated` → Bot 返回词性 + 释义 + 例句，自动入库
-   - 发送句子：`I was utterly devastated by the news` → Bot 翻译整句，提取关键词，用户点选要记的词
-   - 发送中文：`苟且偷生` → Bot 找到对应英文表达
-
-2. **定时复习**
-   - Bot 后台每小时检查到期词汇，自动推送复习题
-   - 也可随时发送 `/review` 手动触发
-
-3. **两种题型**
-   - 🧠 **填空题**：看例句 + 释义提示，从 4 个选项中选出目标单词
-   - 🔤 **选义题**：看单词 + 例句，从 4 个选项中选出正确中文释义
-
-4. **间隔升级**
-   - 答对 → 升一级，按 SM-2 时间表延长复习间隔（1/2/4/7/14/30/90/3650 天）
-   - 答错 → 降回 level 0，明天重新复习
+Vocab Master is an intelligent English vocabulary assistant on Telegram. Unlike traditional flashcard apps, it leverages **AI-generated dynamic contexts** combined with the **Ebbinghaus Forgetting Curve (SM-2 Algorithm)** to solve the problem of "memorizing and forgetting."
 
 ---
 
-## 技术架构
+## ✨ Key Features
 
-| 层级 | 技术 |
-|------|------|
-| Bot 框架 | python-telegram-bot v20（async） |
-| 数据库 | Supabase（PostgreSQL） |
-| AI 服务 | DeepSeek API（兼容 OpenAI 接口） |
-| 调度器 | APScheduler（AsyncIOScheduler） |
-| 部署目标 | Railway（Webhook 模式） |
-| 运行环境 | Python 3.11+ |
+### 🧠 Dynamic Contextual Learning
+Traditional vocabulary books only offer static example sentences. Vocab Master uses LLMs (Large Language Models) to generate content in real-time:
+- **Dynamic Cloze Tests**: The AI generates fresh example sentences based on the word's part of speech and meaning, creating a cloze test that forces users to recall the word through context.
+- **Scenario Reconstruction**: Users can input any sentence, and the Bot automatically extracts key vocabulary to create memory cards.
+- **Reverse Lookup**: Input a concept in your native language (e.g., "苟且偷生"), and the AI matches it with the most authentic English expression (e.g., `eke out a living`).
 
----
+### 📉 Scientific Retention (SM-2 Algorithm)
+Built-in improved SM-2 Spaced Repetition Algorithm that dynamically adjusts review intervals based on user feedback (Easy/Blurry/Forgot):
+- **Review Queue**: Precision review scheduling down to the minute.
+- **Smart Skip**: Words that are fully mastered (Lv7+) are automatically removed from the active review queue.
 
-## 快速上手（本地开发）
-
-### 前置条件
-
-- Python 3.11+
-- [Supabase](https://supabase.com) 账号（免费套餐即可）
-- Telegram Bot Token（通过 [@BotFather](https://t.me/BotFather) 创建）
-- DeepSeek API Key（或其他兼容 OpenAI 接口的 AI 服务）
-
-### 步骤
-
-```bash
-# 1. 克隆项目
-git clone <repo-url>
-cd vocab_master
-
-# 2. 安装依赖
-pip install -r requirements.txt
-
-# 3. 配置环境变量
-cp .env.example .env
-# 编辑 .env，填入所有必填变量
-
-# 4. 初始化数据库
-# 在 Supabase 控制台 → SQL Editor 中执行：
-# database/schema.sql
-
-# 5. 启动 Bot
-python main.py
-```
+### 📊 Data Visualization
+- **Learning Heatmap**: Tracks learning streaks and daily activity.
+- **Mastery Distribution**: Real-time view of vocabulary distribution across different memory stages (Lv0-Lv7).
 
 ---
 
-## 环境变量说明
+## 🏗️ Technical Architecture
 
-| 变量名 | 必填 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `TELEGRAM_BOT_TOKEN` | ✅ | — | BotFather 提供的 Bot Token |
-| `SUPABASE_URL` | ✅ | — | Supabase 项目 URL |
-| `SUPABASE_ANON_KEY` | ✅ | — | Supabase anon/public key |
-| `DEEPSEEK_API_KEY` | ✅ | — | AI 服务 API Key |
-| `AI_BASE_URL` | ❌ | `https://api.deepseek.com/v1` | 兼容 OpenAI 接口的 base URL |
-| `AI_MODEL` | ❌ | `deepseek-chat` | 使用的模型名称 |
-| `SCHEDULER_INTERVAL_MINUTES` | ❌ | `60` | 调度器检查间隔（分钟） |
-| `ADMIN_TELEGRAM_ID` | ❌ | — | 管理员 Telegram 用户 ID，留空则禁用管理员功能 |
+This project adopts a modern Serverless architecture designed for stability and low latency under high concurrency.
 
----
+- **Bot Framework**: `python-telegram-bot` (Async Mode)
+- **Database**: PostgreSQL (Supabase) + Vector Search (Planned)
+- **Job Queue**: APScheduler (Distributed Locking)
+- **AI Core**: DeepSeek / OpenAI API (Custom Prompt Engineering)
+- **Deployment**: Webhook Mode / Docker Containerization
 
-## 数据库初始化
-
-在 Supabase 控制台的 **SQL Editor** 中执行 [`database/schema.sql`](database/schema.sql)，该文件会创建所需的全部表和索引：
-
-- `vocab_records` — 用户词汇记录（含 SM-2 复习状态）
-- `subscriptions` — 订阅信息
-- `activation_codes` — 激活码
+### Core Module Design
+1.  **Scheduler Service**: A distributed task scheduler handling concurrent review notifications for thousands of users.
+2.  **Quiz Generator**: The core logic includes a complex chain of prompts ensuring generated sentences are authentic and match the user's proficiency level.
+3.  **State Management**: User session states and quiz progress are synchronized in real-time with the cloud database.
 
 ---
 
-## 生产部署（Railway）
+## 🚫 License & Copyright
 
-1. 在 Railway 创建新项目，连接 GitHub 仓库
-2. 在 Railway 的 **Variables** 面板配置所有环境变量
-3. 将 `main.py` 中的启动方式切换为 **Webhook 模式**：
-   ```python
-   # 替换 application.run_polling() 为：
-   application.run_webhook(
-       listen="0.0.0.0",
-       port=int(os.environ.get("PORT", 8443)),
-       webhook_url=f"https://<your-railway-domain>/webhook",
-   )
-   ```
-4. Railway 会自动分配域名并保持 Bot 持续运行
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**.
+
+This means:
+1.  **Non-Commercial Use**: You may read the source code for educational purposes.
+2.  **Open Source Obligation**: If you run a network service (like a Telegram Bot) based on this project, you **must** disclose your full source code to all users.
+3.  **No Closed-Source Commercialization**: Any unauthorized commercial modification, deployment, or operation is an infringement.
+
+Copyright © 2024 Ryan (bestian830). All Rights Reserved.
 
 ---
 
-## 项目结构
+## 📅 Roadmap
 
-```
-vocab_master/
-├── main.py                  # 入口：注册 handler + 启动调度器 + polling
-├── config.py                # 环境变量读取
-├── requirements.txt         # Python 依赖
-├── .env.example             # 环境变量模板
-├── database/
-│   ├── client.py            # Supabase CRUD，单例 get_client()
-│   └── schema.sql           # 建表 SQL
-├── ai/
-│   └── parser.py            # parse_user_input() + generate_quiz_sentence()
-├── core/
-│   ├── sm2.py               # SM-2 算法：next_level_and_review()
-│   └── quiz.py              # 测验题生成：build_quiz()
-├── bot/
-│   ├── keyboards.py         # Inline 键盘：quiz_keyboard(), vocab_page_keyboard()
-│   └── handlers/
-│       ├── commands.py      # /start /vocab /review /plan /activate /gencode /extend
-│       ├── messages.py      # 普通文本 → AI 解析 → 入库
-│       └── callbacks.py     # Inline button 回调：答题 + 翻页
-└── scheduler/
-    └── reminder.py          # 定时推送到期复习：setup_scheduler(bot)
-```
+The project is currently in **Beta**. Future updates will include:
+
+- [ ] **Multimodal Memory**: Integrating TTS voice generation and AI image association.
+- [ ] **Social Battles**: Group-based vocabulary PK systems.
+- [ ] **Anki Ecosystem**: Two-way synchronization support for `.apkg` format.
 
 ---
 
-## License
-
-MIT
+*If you are interested in the technical implementation of this project or wish to obtain a commercial license, please contact the author via Telegram.*
