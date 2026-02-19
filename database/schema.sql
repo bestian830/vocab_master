@@ -64,3 +64,28 @@ ALTER TABLE user_settings
 -- 新增 remind_enabled 字段（已有库执行此语句）
 ALTER TABLE user_settings
   ADD COLUMN IF NOT EXISTS remind_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- ── 多语言支持迁移 ────────────────────────────────────────────────────────────
+
+-- vocab_records 新增语言字段（DEFAULT 保证旧数据自动归入英语词库）
+ALTER TABLE vocab_records
+  ADD COLUMN IF NOT EXISTS target_language text NOT NULL DEFAULT 'en',
+  ADD COLUMN IF NOT EXISTS native_language  text NOT NULL DEFAULT 'zh';
+
+-- 重建 UNIQUE 约束：同一用户、同词、同释义、同学习语言才算重复（允许同词跨语言）
+ALTER TABLE vocab_records DROP CONSTRAINT IF EXISTS vocab_records_telegram_id_word_definition_key;
+ALTER TABLE vocab_records
+  ADD CONSTRAINT vocab_records_unique_per_lang
+  UNIQUE (telegram_id, word, definition, target_language);
+
+-- 语言维度的查询效率索引
+CREATE INDEX IF NOT EXISTS idx_vocab_target_lang
+  ON vocab_records(telegram_id, target_language);
+CREATE INDEX IF NOT EXISTS idx_vocab_due_lang
+  ON vocab_records(telegram_id, target_language, next_review);
+
+-- user_settings 新增语言偏好字段
+ALTER TABLE user_settings
+  ADD COLUMN IF NOT EXISTS native_language    text   NOT NULL DEFAULT 'zh',
+  ADD COLUMN IF NOT EXISTS active_language    text   NOT NULL DEFAULT 'en',
+  ADD COLUMN IF NOT EXISTS learning_languages text[] NOT NULL DEFAULT '{"en"}';

@@ -8,6 +8,22 @@ Vocab Master is an intelligent English vocabulary assistant on Telegram. Unlike 
 
 ---
 
+## 📋 Recent Updates
+
+### v0.3 — Multi-Language & Vocab Isolation (2026-02)
+- **Multi-language learning**: Users can study multiple target languages simultaneously and switch the active language via `/language`. Each language has its own independent word list.
+- **Vocab isolation by native language**: The vocab book is now isolated by `(target_language × native_language)`. Users studying English with Chinese vs. Japanese annotations maintain completely separate books — quiz distractors will never mix across native languages.
+- **Localized UI (i18n)**: All bot responses, quiz prompts, and feedback messages are rendered in the user's native language (zh / en / ja / ko / de / fr / es / pt / it / ru).
+- **New-user onboarding flow**: First-time users are guided through selecting their native language → learning language → timezone.
+
+### v0.2 — SM-2 Upgrade & Notifications (2026-01)
+- **3-outcome SM-2**: Quiz results now support three outcomes — *Correct* / *Blurry* / *Forgot* — replacing binary right/wrong for finer-grained interval control.
+- **Notification settings** (`/settings`): Toggle push notifications on/off and configure a preferred daily reminder window.
+- **New commands**: `/practice`, `/language`, `/streak`, `/stats`, `/search`, `/update`, `/delete`, `/export`, `/timezone`, `/settings`.
+- **Vocab detail & inline edit**: Tap any word in `/vocab` to view full details and edit POS / definition / example sentence.
+
+---
+
 ## ✨ Key Features
 
 ### 🧠 Dynamic Contextual Learning
@@ -35,12 +51,13 @@ This project adopts a modern Serverless architecture designed for stability and 
 - **Database**: PostgreSQL (Supabase) + Vector Search (Planned)
 - **Job Queue**: APScheduler (Distributed Locking)
 - **AI Core**: DeepSeek / OpenAI API (Custom Prompt Engineering)
-- **Deployment**: Webhook Mode / Docker Containerization
+- **Deployment**: Koyeb (Webhook Mode)
 
 ### Core Module Design
-1.  **Scheduler Service**: A distributed task scheduler handling concurrent review notifications for thousands of users.
-2.  **Quiz Generator**: The core logic includes a complex chain of prompts ensuring generated sentences are authentic and match the user's proficiency level.
-3.  **State Management**: User session states and quiz progress are synchronized in real-time with the cloud database.
+1. **Scheduler Service**: A distributed task scheduler handling concurrent review notifications per `(user × target_language × native_language)` triplet.
+2. **Quiz Generator**: Two quiz types (cloze fill-in / meaning selection); distractor options are strictly scoped to the same native-language vocab book.
+3. **State Management**: User session states and quiz progress are synchronized in real-time with the cloud database.
+4. **i18n Engine**: All user-facing strings are resolved at runtime from a language table (`bot/i18n.py`), with async caching support.
 
 ---
 
@@ -49,9 +66,9 @@ This project adopts a modern Serverless architecture designed for stability and 
 This project is licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**.
 
 This means:
-1.  **Non-Commercial Use**: You may read the source code for educational purposes.
-2.  **Open Source Obligation**: If you run a network service (like a Telegram Bot) based on this project, you **must** disclose your full source code to all users.
-3.  **No Closed-Source Commercialization**: Any unauthorized commercial modification, deployment, or operation is an infringement.
+1. **Non-Commercial Use**: You may read the source code for educational purposes.
+2. **Open Source Obligation**: If you run a network service (like a Telegram Bot) based on this project, you **must** disclose your full source code to all users.
+3. **No Closed-Source Commercialization**: Any unauthorized commercial modification, deployment, or operation is an infringement.
 
 Copyright © 2026 Ryan (bestian830). All Rights Reserved.
 

@@ -7,9 +7,13 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from ai.parser import parse_user_input, analyze_sentence
-from database.client import upsert_vocab, is_pro, count_vocab, get_today_add_count, update_vocab_fields
+from database.client import (
+    upsert_vocab, is_pro, count_vocab, get_today_add_count,
+    update_vocab_fields, get_user_settings,
+)
 from config import FREE_WORD_LIMIT, FREE_DAILY_LIMIT
 from bot.keyboards import sentence_vocab_keyboard
+from bot.i18n import t_async
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +34,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     用户发送任意文本时触发：
     - 整句输入 → 翻译 + 可点击词汇按钮（由用户选择入库）
     - 单词/词组 → AI 解析后直接入库并回复确认
+    根据用户的 active_language 和 native_language 决定解析行为。
     """
     telegram_id = str(update.effective_user.id)
     user_input = update.message.text.strip()
@@ -38,49 +43,52 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # ── pending_edit 状态优先处理 ──────────────────────────────────────────────
-    # 若用户正在等待编辑某个词汇字段，则将输入视为新字段值
     pending = context.user_data.get("pending_edit")
     if pending:
         record_id = pending["record_id"]
         field = pending["field"]
         word = pending["word"]
         page = pending.get("page", 0)
-        # 清除状态，不论成功与否
         del context.user_data["pending_edit"]
 
+        # 获取用户语言（pending_edit 存入时的 native_language）
+        lang = context.user_data.get("native_language", "zh")
+
         success = update_vocab_fields(record_id, {field: user_input})
-        field_name = {"pos": "词性", "definition": "释义", "context": "例句"}.get(field, field)
+        field_key = {"pos": "edit_field_pos", "definition": "edit_field_def", "context": "edit_field_ctx"}.get(field, field)
+        field_name = await t_async(field_key, lang)
         if success:
-            await update.message.reply_text(
-                f"✅ *{word}* 的{field_name}已更新。",
-                parse_mode="Markdown",
-            )
+            msg = await t_async("edit_updated", lang, word=word, field=field_name)
+            await update.message.reply_text(msg, parse_mode="Markdown")
         else:
-            await update.message.reply_text("⚠️ 更新失败，记录可能已不存在。")
+            msg = await t_async("edit_failed", lang)
+            await update.message.reply_text(msg)
         return
 
     # 展示处理中状态
-    processing_msg = await update.message.reply_text("⏳ 正在解析…")
+    settings = get_user_settings(telegram_id)
+    active_language = settings.get("active_language", "en")
+    native_language = settings.get("native_language", "zh")
+    lang = native_language
+
+    processing_text = await t_async("processing", lang)
+    processing_msg = await update.message.reply_text(processing_text)
 
     # ── 批量添加流程（含逗号且非句子） ────────────────────────────────────────
     if "," in user_input and not _is_sentence(user_input):
         tokens = [t.strip() for t in user_input.split(",") if t.strip()]
         if len(tokens) >= 2:
-            # 计算免费用户剩余可添加数量
             pro = is_pro(telegram_id)
             if not pro:
-                total_count = count_vocab(telegram_id)
+                total_count = count_vocab(telegram_id, target_language=active_language)
                 today_count = get_today_add_count(telegram_id)
                 max_by_total = max(0, FREE_WORD_LIMIT - total_count)
                 max_by_daily = max(0, FREE_DAILY_LIMIT - today_count)
-                # 最多可处理的 token 数（免费用户取两者最小值）
                 allowed = min(max_by_total, max_by_daily)
                 if allowed == 0:
-                    await processing_msg.edit_text(
-                        f"📚 已达添加上限（词库 {FREE_WORD_LIMIT} 词 / 每日 {FREE_DAILY_LIMIT} 词）。\n"
-                        f"发送 `/activate 激活码` 订阅 Pro 解锁无限词库。",
-                        parse_mode="Markdown",
-                    )
+                    msg = await t_async("limit_both_reached", lang,
+                                        total_limit=FREE_WORD_LIMIT, daily_limit=FREE_DAILY_LIMIT)
+                    await processing_msg.edit_text(msg, parse_mode="Markdown")
                     return
                 tokens_to_process = tokens[:allowed]
                 hit_limit = len(tokens) > allowed
@@ -88,20 +96,25 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 tokens_to_process = tokens
                 hit_limit = False
 
-            lines = [f"📚 *批量添加结果（{len(tokens_to_process)}/{len(tokens)}）：*"]
+            title = await t_async("batch_result_title", lang,
+                                   done=len(tokens_to_process), total=len(tokens))
+            lines = [title]
             for token in tokens_to_process:
                 try:
-                    result = await parse_user_input(token)
+                    result = await parse_user_input(
+                        token,
+                        target_language=active_language,
+                        native_language=native_language,
+                    )
                 except Exception as exc:
                     logger.error("AI 解析失败 (%s): %s", token, exc)
-                    lines.append(f"❌ {token} — 解析失败")
+                    lines.append(await t_async("batch_parse_fail", lang, token=token))
                     continue
 
                 if not result.is_vocab or not result.vocabs:
-                    lines.append(f"❌ {token} — 不是有效词汇")
+                    lines.append(await t_async("batch_not_vocab", lang, token=token))
                     continue
 
-                # 取第一个词汇结果入库
                 vocab = result.vocabs[0]
                 try:
                     _, is_new = upsert_vocab(
@@ -110,83 +123,87 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                         pos=vocab.pos,
                         definition=vocab.definition,
                         context=vocab.context,
+                        target_language=active_language,
+                        native_language=native_language,
                     )
                 except Exception as exc:
                     logger.error("数据库写入失败 (%s): %s", token, exc)
-                    lines.append(f"❌ {vocab.word} — 保存失败")
+                    lines.append(await t_async("batch_save_fail", lang, word=vocab.word))
                     continue
 
                 pos_tag = f" [{vocab.pos}]" if vocab.pos else ""
                 if is_new:
-                    lines.append(f"✅ *{vocab.word}*{pos_tag} — {vocab.definition}")
+                    lines.append(await t_async("batch_new", lang,
+                                               word=vocab.word, pos_tag=pos_tag, definition=vocab.definition))
                 else:
-                    lines.append(f"📖 *{vocab.word}*{pos_tag} — {vocab.definition}（已在词库中）")
+                    lines.append(await t_async("batch_exists", lang,
+                                               word=vocab.word, pos_tag=pos_tag, definition=vocab.definition))
 
             if hit_limit:
-                lines.append(f"\n⚠️ 已达添加上限，剩余词汇未处理。")
+                lines.append(await t_async("batch_hit_limit", lang))
 
             await processing_msg.edit_text("\n".join(lines), parse_mode="Markdown")
             return
 
     # ── 整句分析流程 ────────────────────────────────────────────────────────────
     if _is_sentence(user_input):
-        # 整句流程：提前检查免费限额（至少还能添加 1 个词才展示按钮）
         if not is_pro(telegram_id):
-            if count_vocab(telegram_id) >= FREE_WORD_LIMIT:
-                await processing_msg.edit_text(
-                    f"📚 词库已达 {FREE_WORD_LIMIT} 词上限。\n"
-                    f"发送 `/activate 激活码` 订阅 Pro 解锁无限词库。",
-                    parse_mode="Markdown",
-                )
+            if count_vocab(telegram_id, target_language=active_language) >= FREE_WORD_LIMIT:
+                msg = await t_async("limit_total_reached", lang, limit=FREE_WORD_LIMIT)
+                await processing_msg.edit_text(msg, parse_mode="Markdown")
                 return
             if get_today_add_count(telegram_id) >= FREE_DAILY_LIMIT:
-                await processing_msg.edit_text(
-                    f"⏰ 今日已添加 {FREE_DAILY_LIMIT} 个词，明天再来吧！\n"
-                    f"发送 `/activate 激活码` 订阅 Pro 不受限制。",
-                    parse_mode="Markdown",
-                )
+                msg = await t_async("limit_daily_reached", lang, limit=FREE_DAILY_LIMIT)
+                await processing_msg.edit_text(msg, parse_mode="Markdown")
                 return
 
         try:
-            translation, vocabs = await analyze_sentence(user_input)
+            translation, vocabs = await analyze_sentence(
+                user_input,
+                target_language=active_language,
+                native_language=native_language,
+            )
         except Exception as exc:
             logger.error("整句分析失败: %s", exc)
-            await processing_msg.edit_text("😕 解析失败，请稍后重试。")
+            msg = await t_async("parse_fail_simple", lang)
+            await processing_msg.edit_text(msg)
             return
 
         if not vocabs:
-            await processing_msg.edit_text(
-                f"📖 *翻译：*{translation}\n\n（未识别到值得记录的词汇）",
-                parse_mode="Markdown",
-            )
+            msg = await t_async("sentence_no_vocab", lang, translation=translation)
+            await processing_msg.edit_text(msg, parse_mode="Markdown")
             return
 
-        # 将词汇列表存入 chat_data，以消息 ID 为键，供回调取用
         msg_id = processing_msg.message_id
         context.chat_data[str(msg_id)] = [
             {"word": v.word, "pos": v.pos, "definition": v.definition, "context": v.context}
             for v in vocabs
         ]
+        context.chat_data[f"{msg_id}_lang"] = {
+            "target_language": active_language,
+            "native_language": native_language,
+        }
 
         vocab_lines = "\n".join(
             f"• *{v.word}* [{v.pos}] — {v.definition}" for v in vocabs
         )
-        text = (
-            f"📖 *翻译：*{translation}\n\n"
-            f"*点击下方词汇加入词库：*\n{vocab_lines}"
-        )
+        msg = await t_async("sentence_add_prompt", lang,
+                            translation=translation, vocab_lines=vocab_lines)
         keyboard = sentence_vocab_keyboard(vocabs, msg_id, set())
-        await processing_msg.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await processing_msg.edit_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         return
 
-    # ── 单词/词组流程（原有逻辑）──────────────────────────────────────────────
+    # ── 单词/词组流程 ──────────────────────────────────────────────────────────
     try:
-        result = await parse_user_input(user_input)
+        result = await parse_user_input(
+            user_input,
+            target_language=active_language,
+            native_language=native_language,
+        )
     except Exception as exc:
         logger.error("AI 解析失败: %s", exc)
-        await processing_msg.edit_text(
-            "😕 解析失败，请稍后重试。\n（若持续出现，请检查 AI 服务配置）"
-        )
+        msg = await t_async("parse_fail", lang)
+        await processing_msg.edit_text(msg)
         return
 
     if not result.is_vocab:
@@ -195,19 +212,13 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 词汇意图：在入库前检查免费限额
     if not is_pro(telegram_id):
-        if count_vocab(telegram_id) >= FREE_WORD_LIMIT:
-            await processing_msg.edit_text(
-                f"📚 词库已达 {FREE_WORD_LIMIT} 词上限。\n"
-                f"发送 `/activate 激活码` 订阅 Pro 解锁无限词库。",
-                parse_mode="Markdown",
-            )
+        if count_vocab(telegram_id, target_language=active_language) >= FREE_WORD_LIMIT:
+            msg = await t_async("limit_total_reached", lang, limit=FREE_WORD_LIMIT)
+            await processing_msg.edit_text(msg, parse_mode="Markdown")
             return
         if get_today_add_count(telegram_id) >= FREE_DAILY_LIMIT:
-            await processing_msg.edit_text(
-                f"⏰ 今日已添加 {FREE_DAILY_LIMIT} 个词，明天再来吧！\n"
-                f"发送 `/activate 激活码` 订阅 Pro 不受限制。",
-                parse_mode="Markdown",
-            )
+            msg = await t_async("limit_daily_reached", lang, limit=FREE_DAILY_LIMIT)
+            await processing_msg.edit_text(msg, parse_mode="Markdown")
             return
 
     # 逐一入库，收集结果
@@ -220,6 +231,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pos=vocab.pos,
                 definition=vocab.definition,
                 context=vocab.context,
+                target_language=active_language,
+                native_language=native_language,
             )
         except Exception as exc:
             logger.error("数据库写入失败 (%s): %s", vocab.word, exc)

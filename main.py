@@ -19,7 +19,7 @@ from bot.handlers.commands import (
     cmd_start, cmd_help, cmd_vocab, cmd_review, cmd_practice, cmd_streak,
     cmd_activate, cmd_plan, cmd_gencode, cmd_extend, cmd_stats,
     cmd_delete, cmd_search, cmd_export, cmd_timezone, cmd_health,
-    cmd_broadcast, cmd_users, cmd_update, cmd_settings,
+    cmd_broadcast, cmd_users, cmd_update, cmd_settings, cmd_language,
 )
 from bot.handlers.messages import handle_text_message
 from bot.handlers.callbacks import handle_callback
@@ -39,6 +39,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("vocab",    "查看词库"),
         BotCommand("review",   "开始复习"),
         BotCommand("practice", "自由练习"),
+        BotCommand("language", "多语言学习管理"),
         BotCommand("search",   "搜索词库"),
         BotCommand("update",   "编辑词汇内容"),
         BotCommand("delete",   "删除单词"),
@@ -79,6 +80,7 @@ def main() -> None:
     app.add_handler(CommandHandler("users",     cmd_users))
     app.add_handler(CommandHandler("update",    cmd_update))
     app.add_handler(CommandHandler("settings",  cmd_settings))
+    app.add_handler(CommandHandler("language",  cmd_language))
 
     # ── 注册普通文本消息处理器（排除命令）────────────────────────────────────
     app.add_handler(

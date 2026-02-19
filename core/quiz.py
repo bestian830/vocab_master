@@ -1,18 +1,47 @@
 """
 测验生成模块：从词库中选取到期词汇，生成选择题
 支持两种题型：
-- fill（填空题）：4个英文单词选项（2行×2列）+ "跳过"按钮
+- fill（填空题）：4个选项（2行×2列）+ "跳过"按钮
 - meaning（选义题）：4个中文释义选项（2行×2列）+ "模糊/拿不准"按钮
+支持多语言：通过 target_language 指定学习语言
 """
 import re
 import random
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ai.parser import generate_quiz_sentence, generate_example_sentence
 from database.client import get_due_vocab, get_practice_vocab, get_random_words_for_distractor
 
 logger = logging.getLogger(__name__)
+
+# 填空题干扰词：按目标学习语言，词库不足时使用
+_FALLBACK_WORDS: dict[str, list[str]] = {
+    "en": ["apple", "run", "beautiful", "quickly", "jump"],
+    "zh": ["走路", "食物", "快乐", "颜色", "朋友"],
+    "ja": ["食べ物", "走る", "きれい", "友達", "色"],
+    "de": ["Apfel", "laufen", "schön", "schnell", "Freund"],
+    "fr": ["pomme", "courir", "beau", "vite", "ami"],
+    "ko": ["사과", "달리다", "아름다운", "빨리", "친구"],
+    "pt": ["maçã", "correr", "bonito", "rápido", "amigo"],
+    "it": ["mela", "correre", "bello", "velocemente", "amico"],
+    "es": ["manzana", "correr", "hermoso", "rápido", "amigo"],
+    "ru": ["яблоко", "бежать", "красивый", "быстро", "друг"],
+}
+
+# 选义题干扰释义：按母语，词库不足时使用
+_FALLBACK_DEFS: dict[str, list[str]] = {
+    "zh": ["快速地移动", "感到非常高兴", "一种常见的食物", "表示同意或确认"],
+    "en": ["move quickly", "feel very happy", "a common food item", "express agreement"],
+    "ja": ["素早く動く", "とても嬉しい", "一般的な食べ物", "同意を示す"],
+    "de": ["sich schnell bewegen", "sich sehr freuen", "ein häufiges Lebensmittel", "Zustimmung ausdrücken"],
+    "fr": ["se déplacer rapidement", "se sentir très heureux", "un aliment courant", "exprimer un accord"],
+    "ko": ["빠르게 움직이다", "매우 기쁘다", "일반적인 음식", "동의를 표하다"],
+    "pt": ["mover-se rapidamente", "sentir-se muito feliz", "um alimento comum", "expressar concordância"],
+    "it": ["muoversi velocemente", "sentirsi molto felice", "un alimento comune", "esprimere accordo"],
+    "es": ["moverse rápidamente", "sentirse muy feliz", "un alimento común", "expresar acuerdo"],
+    "ru": ["быстро двигаться", "чувствовать себя очень счастливым", "обычный продукт питания", "выражать согласие"],
+}
 
 
 @dataclass
@@ -27,20 +56,31 @@ class QuizQuestion:
     correct_index: int      # 正确选项在 options 中的下标
     quiz_type: str          # "fill" 或 "meaning"
     practice_mode: bool = False  # True 时答题不触发 SM-2 更新
+    target_language: str = "en"  # 该题目对应的学习语言
 
 
-async def build_quiz(telegram_id: str, practice_mode: bool = False) -> QuizQuestion | None:
+async def build_quiz(
+    telegram_id: str,
+    practice_mode: bool = False,
+    target_language: str = "en",
+    native_language: str = "zh",
+) -> QuizQuestion | None:
     """
     为指定用户生成一道复习题。
     随机在 fill（填空题）和 meaning（选义题）中选一种。
     practice_mode=True 时从全部词库取词，答题不触发 SM-2 更新。
+    target_language 指定学习语言，过滤词库。
     若无可用词汇则返回 None。
     """
-    # 1. 根据模式获取词汇列表，随机选一条
+    # 1. 根据模式获取词汇列表，随机选一条（同时按 native_language 过滤，避免跨母语混词）
     if practice_mode:
-        vocab_list = get_practice_vocab(telegram_id)
+        vocab_list = get_practice_vocab(
+            telegram_id, target_language=target_language, native_language=native_language
+        )
     else:
-        vocab_list = get_due_vocab(telegram_id)
+        vocab_list = get_due_vocab(
+            telegram_id, target_language=target_language, native_language=native_language
+        )
     if not vocab_list:
         return None
 
@@ -49,17 +89,27 @@ async def build_quiz(telegram_id: str, practice_mode: bool = False) -> QuizQuest
     word = target["word"]
     definition = target["definition"]
 
-    # 2. 获取干扰项（其他词汇记录，fill题取word，meaning题取definition）
-    distractors_raw = get_random_words_for_distractor(telegram_id, record_id, count=3)
+    # 2. 获取同语言同母语干扰项，避免不同母语释义混入
+    distractors_raw = get_random_words_for_distractor(
+        telegram_id, record_id, count=3,
+        target_language=target_language,
+        native_language=native_language,
+    )
     random.shuffle(distractors_raw)
 
     # 3. 随机决定题型
     quiz_type = random.choice(["fill", "meaning"])
 
     if quiz_type == "fill":
-        return await _build_fill_quiz(target, record_id, word, definition, distractors_raw, practice_mode)
+        return await _build_fill_quiz(
+            target, record_id, word, definition,
+            distractors_raw, practice_mode, target_language, native_language
+        )
     else:
-        return await _build_meaning_quiz(target, record_id, word, definition, distractors_raw, practice_mode)
+        return await _build_meaning_quiz(
+            target, record_id, word, definition,
+            distractors_raw, practice_mode, target_language, native_language
+        )
 
 
 async def _build_fill_quiz(
@@ -69,13 +119,15 @@ async def _build_fill_quiz(
     definition: str,
     distractors_raw: list[dict],
     practice_mode: bool = False,
+    target_language: str = "en",
+    native_language: str = "zh",
 ) -> QuizQuestion:
     """
-    构建填空题：AI生成例句，4个英文单词选项
+    构建填空题：AI 生成目标语言例句，4个词汇选项
     """
     # 生成新例句（避免与入库时相同）
     try:
-        sentence = await generate_quiz_sentence(word, definition)
+        sentence = await generate_quiz_sentence(word, definition, target_language=target_language)
     except Exception as exc:
         logger.warning("生成例句失败，使用入库时的 context: %s", exc)
         sentence = target.get("context") or f"The word is: ______."
@@ -132,8 +184,8 @@ async def _build_fill_quiz(
                     sentence = replaced
                     logger.info("填空题答案泄露，已回退到入库 context：%s", sentence)
 
-    # 用 fallback 词补足干扰项（词库不足时）
-    fallback_words = ["apple", "run", "beautiful", "quickly", "jump"]
+    # 用 fallback 词补足干扰项（词库不足时，按目标语言选词）
+    fallback_words = _FALLBACK_WORDS.get(target_language, _FALLBACK_WORDS["en"])
     distractor_words: list[str] = [d["word"] for d in distractors_raw[:3]]
     while len(distractor_words) < 3:
         fb = random.choice(fallback_words)
@@ -158,6 +210,7 @@ async def _build_fill_quiz(
         correct_index=correct_index,
         quiz_type="fill",
         practice_mode=practice_mode,
+        target_language=target_language,
     )
 
 
@@ -168,26 +221,23 @@ async def _build_meaning_quiz(
     definition: str,
     distractors_raw: list[dict],
     practice_mode: bool = False,
+    target_language: str = "en",
+    native_language: str = "zh",
 ) -> QuizQuestion:
     """
-    构建选义题：AI 生成新例句（不含占位符），4个中文释义选项
+    构建选义题：AI 生成新例句（不含占位符），4个母语释义选项
     """
     # 调用 AI 生成多样化例句，展示单词在真实语境中的用法
     try:
-        sentence = await generate_example_sentence(word, definition)
+        sentence = await generate_example_sentence(word, definition, target_language=target_language)
         if not sentence:
             raise ValueError("empty response")
     except Exception as exc:
         logger.warning("选义题生成例句失败，使用入库 context: %s", exc)
         sentence = target.get("context") or f"She used the word {word} in her speech."
 
-    # 从干扰项中取 definition 作混淆选项
-    fallback_definitions = [
-        "快速地移动",
-        "感到非常高兴",
-        "一种常见的食物",
-        "表示同意或确认",
-    ]
+    # 从干扰项中取 definition 作混淆选项（按母语选 fallback，确保语言一致）
+    fallback_definitions = _FALLBACK_DEFS.get(native_language, _FALLBACK_DEFS["en"])
     distractor_defs: list[str] = [
         d["definition"] for d in distractors_raw[:3]
         if d.get("definition") and d["definition"] != definition
@@ -214,4 +264,5 @@ async def _build_meaning_quiz(
         correct_index=correct_index,
         quiz_type="meaning",
         practice_mode=practice_mode,
+        target_language=target_language,
     )

@@ -28,11 +28,12 @@ def upsert_vocab(
     pos: str | None,
     definition: str,
     context: str | None,
+    target_language: str = "en",
+    native_language: str = "zh",
 ) -> tuple[dict, bool]:
     """
-    插入新词汇；若 (telegram_id, word, definition) 已存在则跳过（ON CONFLICT DO NOTHING）。
+    插入新词汇；若 (telegram_id, word, definition, target_language) 已存在则跳过。
     返回 (记录 dict, is_new: bool)。
-    冲突跳过时 result.data 为空列表，据此判断是否真正新增。
     """
     db = get_client()
     result = (
@@ -44,8 +45,10 @@ def upsert_vocab(
                 "pos": pos,
                 "definition": definition,
                 "context": context,
+                "target_language": target_language,
+                "native_language": native_language,
             },
-            on_conflict="telegram_id,word,definition",
+            on_conflict="telegram_id,word,definition,target_language",
             # 已存在时不覆盖任何字段（不重置复习进度）
             ignore_duplicates=True,
         )
@@ -61,6 +64,7 @@ def upsert_vocab(
         .eq("telegram_id", telegram_id)
         .eq("word", word)
         .eq("definition", definition)
+        .eq("target_language", target_language)
         .limit(1)
         .execute()
         .data
@@ -68,53 +72,72 @@ def upsert_vocab(
     return rows[0] if rows else {}, is_new
 
 
-def get_due_vocab(telegram_id: str) -> list[dict]:
-    """查询该用户所有到期（next_review <= now）的词汇"""
+def get_due_vocab(
+    telegram_id: str,
+    target_language: str = "en",
+    native_language: str | None = None,
+) -> list[dict]:
+    """查询该用户指定语言所有到期（next_review <= now）的词汇"""
     db = get_client()
-    return (
+    query = (
         db.table("vocab_records")
         .select("*")
         .eq("telegram_id", telegram_id)
+        .eq("target_language", target_language)
         .lte("next_review", "now()")
-        .order("next_review")
-        .execute()
-        .data
     )
+    if native_language:
+        query = query.eq("native_language", native_language)
+    return query.order("next_review").execute().data
 
 
 def get_all_due_users() -> list[dict]:
     """
-    查询所有有到期词汇的用户，用于调度器批量推送。
-    返回 [{"telegram_id": ..., "count": ...}, ...]
+    查询所有有到期词汇的用户，按 (telegram_id, target_language) 去重。
+    返回 [{"telegram_id": ..., "target_language": ...}, ...]
+    每个用户可因多语言而出现多条。
     """
     db = get_client()
-    # Supabase 不直接支持 GROUP BY，用 RPC 或简化查询
     rows = (
         db.table("vocab_records")
-        .select("telegram_id")
+        .select("telegram_id,target_language")
         .lte("next_review", "now()")
         .execute()
         .data
     )
-    # 在 Python 侧去重
-    seen: set[str] = set()
+    # Python 侧按 (telegram_id, target_language) 去重
+    seen: set[tuple] = set()
     result: list[dict] = []
     for row in rows:
         tid = row["telegram_id"]
-        if tid not in seen:
-            seen.add(tid)
-            result.append({"telegram_id": tid})
+        lang = row.get("target_language", "en")
+        key = (tid, lang)
+        if key not in seen:
+            seen.add(key)
+            result.append({"telegram_id": tid, "target_language": lang})
     return result
 
 
-def get_vocab_list(telegram_id: str, page: int = 0, page_size: int = 10) -> list[dict]:
-    """分页获取用户词库，按 level ASC, next_review ASC 排序（最需复习的排前面）"""
+def get_vocab_list(
+    telegram_id: str,
+    page: int = 0,
+    page_size: int = 10,
+    target_language: str = "en",
+    native_language: str | None = None,
+) -> list[dict]:
+    """分页获取用户指定语言词库，按 level ASC, next_review ASC 排序"""
     db = get_client()
     offset = page * page_size
-    return (
+    query = (
         db.table("vocab_records")
         .select("id,word,pos,definition,level,review_count,next_review")
         .eq("telegram_id", telegram_id)
+        .eq("target_language", target_language)
+    )
+    if native_language:
+        query = query.eq("native_language", native_language)
+    return (
+        query
         .order("level", desc=False)
         .order("next_review", desc=False)
         .range(offset, offset + page_size - 1)
@@ -123,16 +146,22 @@ def get_vocab_list(telegram_id: str, page: int = 0, page_size: int = 10) -> list
     )
 
 
-def count_vocab(telegram_id: str) -> int:
-    """返回用户词库总数"""
+def count_vocab(
+    telegram_id: str,
+    target_language: str = "en",
+    native_language: str | None = None,
+) -> int:
+    """返回用户指定语言词库总数"""
     db = get_client()
-    result = (
+    query = (
         db.table("vocab_records")
         .select("id", count="exact")
         .eq("telegram_id", telegram_id)
-        .execute()
+        .eq("target_language", target_language)
     )
-    return result.count or 0
+    if native_language:
+        query = query.eq("native_language", native_language)
+    return query.execute().count or 0
 
 
 def update_vocab_after_review(
@@ -369,33 +398,44 @@ def get_vocab_by_word(telegram_id: str, word: str) -> list[dict]:
     )
 
 
-def get_practice_vocab(telegram_id: str, limit: int = 100) -> list[dict]:
+def get_practice_vocab(
+    telegram_id: str,
+    limit: int = 100,
+    target_language: str = "en",
+    native_language: str | None = None,
+) -> list[dict]:
     """获取词库中随机词汇，不限 next_review，供练习模式使用"""
-    return (
+    query = (
         get_client()
         .table("vocab_records")
         .select("*")
         .eq("telegram_id", telegram_id)
-        .limit(limit)
-        .execute()
-        .data
+        .eq("target_language", target_language)
     )
+    if native_language:
+        query = query.eq("native_language", native_language)
+    return query.limit(limit).execute().data
 
 
 def get_random_words_for_distractor(
-    telegram_id: str, exclude_id: str, count: int = 3
+    telegram_id: str,
+    exclude_id: str,
+    count: int = 3,
+    target_language: str = "en",
+    native_language: str | None = None,
 ) -> list[dict]:
-    """随机取 count 条不同的词作为干扰项"""
+    """随机取 count 条同语言的不同词作为干扰项（干扰项与正确词同语言）"""
     db = get_client()
-    return (
+    query = (
         db.table("vocab_records")
         .select("id,word,definition")
         .eq("telegram_id", telegram_id)
+        .eq("target_language", target_language)
         .neq("id", exclude_id)
-        .limit(count * 3)   # 多取一些，Python 侧随机截取
-        .execute()
-        .data
     )
+    if native_language:
+        query = query.eq("native_language", native_language)
+    return query.limit(count * 3).execute().data  # 多取一些，Python 侧随机截取
 
 
 def get_all_vocab(telegram_id: str) -> list[dict]:
@@ -403,7 +443,7 @@ def get_all_vocab(telegram_id: str) -> list[dict]:
     db = get_client()
     return (
         db.table("vocab_records")
-        .select("word,pos,definition,context,level,next_review,created_at")
+        .select("word,pos,definition,context,level,next_review,created_at,target_language")
         .eq("telegram_id", telegram_id)
         .order("created_at", desc=True)
         .execute()
@@ -425,18 +465,39 @@ def get_vocab_detail(record_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def get_vocab_count_by_language(telegram_id: str) -> dict[str, int]:
+    """返回各语言词汇数量 {lang_code: count}"""
+    db = get_client()
+    rows = (
+        db.table("vocab_records")
+        .select("target_language")
+        .eq("telegram_id", telegram_id)
+        .execute()
+        .data
+    )
+    result: dict[str, int] = {}
+    for row in rows:
+        lang = row.get("target_language", "en")
+        result[lang] = result.get(lang, 0) + 1
+    return result
+
+
 # ── 用户设置 ──────────────────────────────────────────────────────────────────
 
 def get_user_settings(telegram_id: str) -> dict:
     """
     获取用户设置，不存在或表不存在时返回默认值（静默处理）。
-    返回字段: timezone, remind_start, remind_end, remind_enabled
+    返回字段: timezone, remind_start, remind_end, remind_enabled,
+              native_language, active_language, learning_languages
     """
     db = get_client()
     try:
         rows = (
             db.table("user_settings")
-            .select("timezone,remind_start,remind_end,remind_enabled")
+            .select(
+                "timezone,remind_start,remind_end,remind_enabled,"
+                "native_language,active_language,learning_languages"
+            )
             .eq("telegram_id", telegram_id)
             .limit(1)
             .execute()
@@ -444,13 +505,32 @@ def get_user_settings(telegram_id: str) -> dict:
         )
     except Exception:
         # 表不存在（PGRST205）或其他错误时静默降级
-        return {"timezone": "UTC", "remind_start": 8, "remind_end": 22, "remind_enabled": True}
+        return _default_settings()
     if rows:
-        # remind_enabled 字段可能尚未存在（旧数据库），降级为 True
         row = rows[0]
+        # 新字段可能在旧数据库中不存在，补充默认值
         row.setdefault("remind_enabled", True)
+        row.setdefault("native_language", "zh")
+        row.setdefault("active_language", "en")
+        row.setdefault("learning_languages", ["en"])
+        # learning_languages 可能返回 None（旧行），确保是列表
+        if not row.get("learning_languages"):
+            row["learning_languages"] = ["en"]
         return row
-    return {"timezone": "UTC", "remind_start": 8, "remind_end": 22, "remind_enabled": True}
+    return _default_settings()
+
+
+def _default_settings() -> dict:
+    """返回用户设置的默认值"""
+    return {
+        "timezone": "UTC",
+        "remind_start": 8,
+        "remind_end": 22,
+        "remind_enabled": True,
+        "native_language": "zh",
+        "active_language": "en",
+        "learning_languages": ["en"],
+    }
 
 
 def has_user_settings(telegram_id: str) -> bool:
@@ -468,6 +548,54 @@ def has_user_settings(telegram_id: str) -> bool:
         return bool(rows)
     except Exception:
         return False
+
+
+def set_user_languages(
+    telegram_id: str,
+    native_language: str | None = None,
+    active_language: str | None = None,
+) -> None:
+    """upsert 用户语言设置（native_language 和/或 active_language）"""
+    db = get_client()
+    payload: dict = {"telegram_id": telegram_id}
+    if native_language is not None:
+        payload["native_language"] = native_language
+    if active_language is not None:
+        payload["active_language"] = active_language
+    try:
+        db.table("user_settings").upsert(
+            payload, on_conflict="telegram_id"
+        ).execute()
+    except Exception as exc:
+        raise RuntimeError("user_settings 表不存在") from exc
+
+
+def add_learning_language(telegram_id: str, lang: str) -> None:
+    """追加新语言到 learning_languages 数组（若不存在则添加，已存在则跳过）"""
+    db = get_client()
+    # 先读取当前值
+    try:
+        rows = (
+            db.table("user_settings")
+            .select("learning_languages")
+            .eq("telegram_id", telegram_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+    except Exception:
+        return
+
+    current = rows[0].get("learning_languages", ["en"]) if rows else ["en"]
+    if not isinstance(current, list):
+        current = ["en"]
+    if lang not in current:
+        current = current + [lang]
+
+    db.table("user_settings").upsert(
+        {"telegram_id": telegram_id, "learning_languages": current},
+        on_conflict="telegram_id",
+    ).execute()
 
 
 def update_remind_window(telegram_id: str, start_h: int, end_h: int) -> None:
