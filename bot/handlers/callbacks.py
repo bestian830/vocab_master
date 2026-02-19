@@ -27,7 +27,9 @@ from bot.keyboards import (
     vocab_detail_keyboard, edit_field_keyboard, settings_panel_keyboard,
     remind_window_keyboard, language_panel_keyboard, add_language_keyboard,
     native_language_keyboard, onboarding_lang_keyboard, timezone_keyboard,
+    vocab_confirm_keyboard,
 )
+import random as _random
 from bot.handlers.commands import _send_quiz, _vocab_line
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     elif data.startswith("ob_lang:"):
         await _handle_onboard_lang(query, telegram_id, data, context)
+        return
+    elif data.startswith("vc:"):
+        await _handle_vocab_confirm(query, telegram_id, data, context)
         return
 
     await query.answer()
@@ -476,7 +481,9 @@ async def _push_next_quiz(
 ) -> None:
     """
     答题或跳过后，自动推送下一道题目。
-    从 context.user_data 读取 active_language；lang 用于反馈文案语言。
+    practice 模式：从 context.user_data["practice_queue"] pop 取词（shuffle 队列），
+                   队列耗尽时重新获取并 shuffle（循环不停止）。
+    review 模式：沿用原逻辑（build_quiz 随机选到期词）。
     """
     target_language = "en"
     native_language = "zh"
@@ -485,9 +492,24 @@ async def _push_next_quiz(
         native_language = context.user_data.get("native_language", "zh")
 
     try:
+        force_vocab = None
+        if practice_mode and context is not None:
+            # 从 shuffle 队列 pop 下一个词；队列空则重新获取并 shuffle
+            from database.client import get_practice_vocab
+            queue: list = context.user_data.get("practice_queue", [])
+            if not queue:
+                queue = get_practice_vocab(
+                    telegram_id, target_language=target_language, native_language=native_language
+                )
+                _random.shuffle(queue)
+            if queue:
+                force_vocab = queue.pop(0)
+                context.user_data["practice_queue"] = queue
+
         next_question = await build_quiz(
             telegram_id, practice_mode=practice_mode,
-            target_language=target_language, native_language=native_language
+            target_language=target_language, native_language=native_language,
+            force_vocab=force_vocab,
         )
         if next_question:
             await _send_quiz(query.message.reply_text, next_question, lang=lang)
@@ -544,7 +566,11 @@ async def _handle_vocab_delete(query, telegram_id: str, data: str, context=None)
         if len(parts) < 3:
             return
         word = parts[2]
-        count = delete_vocab_by_word(telegram_id, word)
+        # 从 user_data 读取激活语言，限制跨语言删除
+        active_language = None
+        if context is not None:
+            active_language = context.user_data.get("active_language")
+        count = delete_vocab_by_word(telegram_id, word, target_language=active_language)
         if count > 0:
             msg = await t_async("delete_ok_all", lang, word=word, count=count)
         else:
@@ -1034,6 +1060,126 @@ async def _handle_onboard_native(query, telegram_id: str, data: str, context) ->
         await query.edit_message_text(msg, reply_markup=keyboard)
     except Exception:
         pass
+
+
+async def _handle_vocab_confirm(query, telegram_id: str, data: str, context) -> None:
+    """
+    callback_data 格式:
+      vc:add:{msg_id}:{idx}  — 入库解析结果中的第 idx 条词汇
+      vc:skip:{msg_id}       — 跳过，取消本次入库
+    """
+    parts = data.split(":", 3)
+    if len(parts) < 3:
+        await query.answer()
+        return
+
+    action = parts[1]
+
+    # 已入库的占位按钮：直接静默响应
+    if action == "done":
+        await query.answer()
+        return
+
+    await query.answer()
+
+    if action == "skip":
+        msg_id_str = parts[2]
+        # 清理暂存数据
+        context.chat_data.pop(f"vc_{msg_id_str}", None)
+        context.chat_data.pop(f"vc_{msg_id_str}_lang", None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    if action == "add":
+        if len(parts) < 4:
+            return
+        msg_id_str = parts[2]
+        try:
+            idx = int(parts[3])
+        except ValueError:
+            return
+
+        vocabs_raw: list[dict] | None = context.chat_data.get(f"vc_{msg_id_str}")
+        if not vocabs_raw or idx >= len(vocabs_raw):
+            await query.answer("词汇信息已过期，请重新发送。", show_alert=True)
+            return
+
+        lang_meta = context.chat_data.get(f"vc_{msg_id_str}_lang", {})
+        target_language = lang_meta.get("target_language", "en")
+        native_language = lang_meta.get("native_language", "zh")
+        tid = lang_meta.get("telegram_id", telegram_id)
+        lang = native_language
+
+        vocab = vocabs_raw[idx]
+
+        # 入库前检查免费用户限额
+        if not is_pro(tid):
+            if count_vocab(tid, target_language=target_language) >= FREE_WORD_LIMIT:
+                alert = await t_async("limit_total_alert", lang, limit=FREE_WORD_LIMIT)
+                await query.answer(alert, show_alert=True)
+                return
+            if get_today_add_count(tid) >= FREE_DAILY_LIMIT:
+                alert = await t_async("limit_daily_alert", lang, limit=FREE_DAILY_LIMIT)
+                await query.answer(alert, show_alert=True)
+                return
+
+        try:
+            _, is_new = upsert_vocab(
+                telegram_id=tid,
+                word=vocab["word"],
+                pos=vocab["pos"],
+                definition=vocab["definition"],
+                context=vocab["context"],
+                target_language=target_language,
+                native_language=native_language,
+            )
+        except Exception as exc:
+            logger.error("vc:add 入库失败 (%s): %s", vocab["word"], exc)
+            await query.answer("保存失败，请重试。", show_alert=True)
+            return
+
+        hint = "已加入词库！" if is_new else "已在词库中"
+        await query.answer(f"✅ {vocab['word']} {hint}")
+
+        # 将已入库的按钮替换为 ✅ 已添加，不可再点
+        class _V:
+            def __init__(self, d):
+                self.word = d["word"]
+                self.pos = d.get("pos")
+        vocab_objs = [_V(v) for v in vocabs_raw]
+
+        # 标记已入库按钮：更新按钮标签为"✅ 已添加 {word}"
+        added_label = "✅ 已添加" if lang == "zh" else "✅ Added"
+        skip_label = "Skip ❌" if lang != "zh" else "跳过 ❌"
+        add_label = "✅ Add" if lang != "zh" else "✅ 添加"
+
+        # 追踪已入库下标
+        added_key = f"vc_{msg_id_str}_added"
+        added: set[int] = context.chat_data.get(added_key, set())
+        added.add(idx)
+        context.chat_data[added_key] = added
+
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        rows = []
+        for i, v in enumerate(vocab_objs):
+            pos_part = f"  [{v.pos}]" if v.pos else ""
+            if i in added:
+                label = f"{added_label}  {v.word}{pos_part}"
+                # 已入库的不再响应，callback 指向一个无害的占位
+                rows.append([InlineKeyboardButton(label, callback_data=f"vc:done:{msg_id_str}:{i}")])
+            else:
+                label = f"{add_label}  {v.word}{pos_part}"
+                rows.append([InlineKeyboardButton(label, callback_data=f"vc:add:{msg_id_str}:{i}")])
+        rows.append([InlineKeyboardButton(skip_label, callback_data=f"vc:skip:{msg_id_str}")])
+        keyboard = InlineKeyboardMarkup(rows)
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=keyboard)
+        except Exception:
+            pass
 
 
 async def _handle_onboard_lang(query, telegram_id: str, data: str, context) -> None:

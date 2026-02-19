@@ -64,27 +64,34 @@ async def build_quiz(
     practice_mode: bool = False,
     target_language: str = "en",
     native_language: str = "zh",
+    force_vocab: dict | None = None,
 ) -> QuizQuestion | None:
     """
     为指定用户生成一道复习题。
     随机在 fill（填空题）和 meaning（选义题）中选一种。
     practice_mode=True 时从全部词库取词，答题不触发 SM-2 更新。
     target_language 指定学习语言，过滤词库。
+    force_vocab: 直接指定本题目标词（跳过随机选取），用于 shuffle 队列模式。
     若无可用词汇则返回 None。
     """
     # 1. 根据模式获取词汇列表，随机选一条（同时按 native_language 过滤，避免跨母语混词）
-    if practice_mode:
+    if force_vocab is not None:
+        # 由外部（shuffle 队列）直接指定目标词，跳过随机选取
+        target = force_vocab
+    elif practice_mode:
         vocab_list = get_practice_vocab(
             telegram_id, target_language=target_language, native_language=native_language
         )
+        if not vocab_list:
+            return None
+        target = random.choice(vocab_list)
     else:
         vocab_list = get_due_vocab(
             telegram_id, target_language=target_language, native_language=native_language
         )
-    if not vocab_list:
-        return None
-
-    target = random.choice(vocab_list)
+        if not vocab_list:
+            return None
+        target = random.choice(vocab_list)
     record_id = target["id"]
     word = target["word"]
     definition = target["definition"]
@@ -182,7 +189,18 @@ async def _build_fill_quiz(
                 replaced = re.sub(re.escape(word), "______", fallback, flags=re.IGNORECASE)
                 if replaced != fallback:  # 成功替换，使用 context 回退句
                     sentence = replaced
-                    logger.info("填空题答案泄露，已回退到入库 context：%s", sentence)
+                    logger.info("填空题答案泄露（短语），已回退到入库 context：%s", sentence)
+
+    # 最终兜底：去掉空白后若目标词仍可见（单词或短语均适用），回退到 context 或简单句
+    sentence_no_blank = re.sub(r'_+', '', sentence)
+    if re.search(r'\b' + re.escape(word) + r'\b', sentence_no_blank, re.IGNORECASE):
+        fallback = target.get("context", "")
+        if fallback:
+            replaced = re.sub(re.escape(word), "______", fallback, flags=re.IGNORECASE)
+            sentence = replaced if replaced != fallback else fallback + " (______)"
+        else:
+            sentence = f"______ — {definition}"
+        logger.info("填空题答案泄露（兜底），已回退：%s", sentence)
 
     # 用 fallback 词补足干扰项（词库不足时，按目标语言选词）
     fallback_words = _FALLBACK_WORDS.get(target_language, _FALLBACK_WORDS["en"])

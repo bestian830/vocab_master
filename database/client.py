@@ -355,16 +355,21 @@ def delete_vocab_by_id(record_id: str) -> bool:
     return bool(result.data)
 
 
-def delete_vocab_by_word(telegram_id: str, word: str) -> int:
-    """按用户 ID + 单词（大小写不敏感）删除全部匹配记录，返回删除条数"""
+def delete_vocab_by_word(
+    telegram_id: str, word: str, target_language: str | None = None
+) -> int:
+    """按用户 ID + 单词（大小写不敏感）删除全部匹配记录，返回删除条数。
+    target_language 不为 None 时限制在该语言词库内删除。"""
     db = get_client()
-    result = (
+    query = (
         db.table("vocab_records")
         .delete()
         .eq("telegram_id", telegram_id)
         .ilike("word", word)
-        .execute()
     )
+    if target_language is not None:
+        query = query.eq("target_language", target_language)
+    result = query.execute()
     return len(result.data) if result.data else 0
 
 
@@ -385,17 +390,21 @@ def get_level_distribution(telegram_id: str) -> dict[int, int]:
     return dist
 
 
-def get_vocab_by_word(telegram_id: str, word: str) -> list[dict]:
-    """按用户 ID + 单词（大小写不敏感）查询所有匹配记录，含例句和下次复习时间"""
+def get_vocab_by_word(
+    telegram_id: str, word: str, target_language: str | None = None
+) -> list[dict]:
+    """按用户 ID + 单词（大小写不敏感）查询所有匹配记录，含例句和下次复习时间。
+    target_language 不为 None 时限制在该语言词库内查询。"""
     db = get_client()
-    return (
+    query = (
         db.table("vocab_records")
         .select("id,word,pos,definition,level,context,next_review")
         .eq("telegram_id", telegram_id)
         .ilike("word", word)
-        .execute()
-        .data
     )
+    if target_language is not None:
+        query = query.eq("target_language", target_language)
+    return query.execute().data
 
 
 def get_practice_vocab(

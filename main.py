@@ -36,21 +36,21 @@ logger = logging.getLogger(__name__)
 async def _post_init(app: Application) -> None:
     """Bot 启动后注册 Telegram 命令菜单（输入 / 时自动提示）"""
     await app.bot.set_my_commands([
-        BotCommand("vocab",    "查看词库"),
-        BotCommand("review",   "开始复习"),
-        BotCommand("practice", "自由练习"),
-        BotCommand("language", "多语言学习管理"),
-        BotCommand("search",   "搜索词库"),
-        BotCommand("update",   "编辑词汇内容"),
-        BotCommand("delete",   "删除单词"),
-        BotCommand("stats",    "学习统计"),
-        BotCommand("streak",   "连续学习天数"),
-        BotCommand("export",   "导出词库"),
-        BotCommand("timezone", "设置时区"),
-        BotCommand("settings", "通知设置"),
-        BotCommand("plan",     "订阅状态"),
-        BotCommand("activate", "激活订阅"),
-        BotCommand("help",     "使用帮助"),
+        BotCommand("vocab",    "Browse your word list"),
+        BotCommand("review",   "Start a review session"),
+        BotCommand("practice", "Free practice mode"),
+        BotCommand("language", "Manage learning languages"),
+        BotCommand("search",   "Search your vocabulary"),
+        BotCommand("update",   "Edit a vocab entry"),
+        BotCommand("delete",   "Delete a word"),
+        BotCommand("stats",    "View learning statistics"),
+        BotCommand("streak",   "View your learning streak"),
+        BotCommand("export",   "Export your word list"),
+        BotCommand("timezone", "Set your timezone"),
+        BotCommand("settings", "Notification settings"),
+        BotCommand("plan",     "View subscription status"),
+        BotCommand("activate", "Activate a subscription code"),
+        BotCommand("help",     "Show help"),
     ])
     logger.info("Telegram 命令菜单已注册")
 
