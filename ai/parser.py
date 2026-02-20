@@ -5,6 +5,7 @@ AI 解析器：意图识别 + 词汇结构化解析
 """
 import json
 import logging
+import random
 from dataclasses import dataclass
 
 from openai import AsyncOpenAI
@@ -12,6 +13,20 @@ from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY, AI_BASE_URL, AI_MODEL
 
 logger = logging.getLogger(__name__)
+
+# ── 例句场景列表（随机注入 prompt，确保每次生成例句不同） ──────────────────────────
+_SENTENCE_SCENARIOS = [
+    "daily conversation",
+    "workplace / professional setting",
+    "academic or formal writing",
+    "travel or outdoor activity",
+    "news article or journalism",
+    "social media or casual text",
+    "literature or storytelling",
+    "sports or competition",
+    "technology or science",
+    "historical or cultural context",
+]
 
 # ── 初始化 OpenAI 兼容客户端 ─────────────────────────────────────────────────
 
@@ -75,6 +90,10 @@ def _build_system_prompt(target_language: str = "en", native_language: str = "zh
         f"  优先选：短语动词、习语、专业词汇、不常见单词\n"
         f"- 其他语言词语（如用户母语词汇）→ 找到 {target_name} 对应词并解析\n"
         f"- 其他（如问候、要求写代码、聊天等）→ 非词汇意图\n\n"
+        f"【外来词 / 俚语处理规则】\n"
+        f"如果输入的词看起来是音译外来词（如日语、韩语、粤语、英语等进入中文的网络用语），\n"
+        f"请优先按其来源语言含义解析，而非按汉字字面意思推断。\n"
+        f"例如：\"西巴\" 是韩语 시발 的音译，含义是感叹词/粗口；\"欧尼\" 是韩语 언니（姐姐）的音译。\n\n"
         f"【输出格式】\n"
         f"词汇意图时，严格输出以下 JSON（不要加 markdown 代码块）：\n"
         '{\n'
@@ -263,8 +282,10 @@ async def generate_example_sentence(
     target_meta = LANGUAGE_META.get(target_language, {"name": target_language.upper()})
     lang_name = target_meta["name"]
 
+    scenario = random.choice(_SENTENCE_SCENARIOS)
     prompt = (
         f'Word: "{word}" ({definition})\n'
+        f"Scenario: {scenario}\n"
         f"Write one natural {lang_name} example sentence using this word. "
         f"Output only the sentence."
     )
@@ -281,7 +302,7 @@ async def generate_example_sentence(
             {"role": "user", "content": prompt},
         ],
         max_tokens=100,
-        temperature=0.7,
+        temperature=0.9,
     )
     return resp.choices[0].message.content.strip()
 
@@ -297,14 +318,20 @@ async def generate_quiz_sentence(
     target_meta = LANGUAGE_META.get(target_language, {"name": target_language.upper()})
     lang_name = target_meta["name"]
 
+    scenario = random.choice(_SENTENCE_SCENARIOS)
     prompt = (
         f"Create a fill-in-the-blank sentence in {lang_name} for the word/phrase: "
         f"'{word}' ({definition}).\n"
+        f"Scenario: {scenario}\n"
         f"Instructions:\n"
         f"1. Write a natural {lang_name} sentence that contains the exact word/phrase '{word}' "
         f"(do NOT change any word in the phrase).\n"
         f"2. Replace the entire word/phrase '{word}' with exactly six underscores: ______\n"
         f"3. Output ONLY the fill-in-the-blank sentence. No explanations, no parentheses.\n"
+        f"4. If the phrase starts with a preposition or article (e.g. 'in limbo' starts with 'in'), "
+        f"do NOT place that same word immediately before the ______.\n"
+        f"   Bad:  'She was stuck in ______ for weeks.'\n"
+        f"   Good: 'Her application sat ______ for weeks.'\n"
         f"Example: For 'give up' → output: Don't ______ just because it's hard.\n"
         f"Important: The word/phrase '{word}' must NOT appear anywhere in the output."
     )
@@ -320,7 +347,7 @@ async def generate_quiz_sentence(
             },
             {"role": "user", "content": prompt},
         ],
-        temperature=0.7,
+        temperature=0.9,
         max_tokens=100,
     )
     result = response.choices[0].message.content.strip()

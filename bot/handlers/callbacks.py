@@ -18,6 +18,7 @@ from database.client import (
     get_vocab_detail, set_user_timezone, get_user_settings,
     update_remind_window, set_remind_enabled, get_vocab_count_by_language,
     set_user_languages, add_learning_language,
+    count_vocab_by_native, delete_vocab_by_native_language,
 )
 from config import FREE_WORD_LIMIT, FREE_DAILY_LIMIT
 from core.quiz import build_quiz
@@ -27,7 +28,7 @@ from bot.keyboards import (
     vocab_detail_keyboard, edit_field_keyboard, settings_panel_keyboard,
     remind_window_keyboard, language_panel_keyboard, add_language_keyboard,
     native_language_keyboard, onboarding_lang_keyboard, timezone_keyboard,
-    vocab_confirm_keyboard,
+    vocab_confirm_keyboard, native_switch_confirm_keyboard,
 )
 import random as _random
 from bot.handlers.commands import _send_quiz, _vocab_line
@@ -53,7 +54,19 @@ def _extract_quiz_sentence(message_text: str, quiz_type: str, correct_word: str 
                 continue
             if "______" in line or "___" in line:
                 if correct_word:
-                    return re.sub(r'_+', correct_word, line, count=1)
+                    filled = re.sub(r'_+', correct_word, line, count=1)
+                    # 修复短语首词重复：如 "in in limbo" → "in limbo"
+                    words = correct_word.split()
+                    if len(words) > 1:
+                        first = re.escape(words[0])
+                        phrase = re.escape(correct_word)
+                        filled = re.sub(
+                            rf'(?<!\w){first}\s+{phrase}(?!\w)',
+                            correct_word,
+                            filled,
+                            flags=re.IGNORECASE,
+                        )
+                    return filled
                 return line
     else:  # meaning
         # 找被引号包裹的行（选义题的例句格式）
@@ -202,8 +215,13 @@ async def _handle_quiz_answer(
 
     if practice_mode:
         if correct:
+            # 答对时也展示例句翻译，辅助学习
+            quiz_sentence = _extract_quiz_sentence(query.message.text, "fill", correct_word)
+            context_text = quiz_sentence or row.get("context") or ""
+            context_line = await _build_context_line(context_text, correct_word, definition, target_language, native_language)
             feedback = await t_async("quiz_correct_practice", lang,
-                                     word=correct_word, definition=definition)
+                                     word=correct_word, definition=definition,
+                                     context_line=context_line)
         else:
             quiz_sentence = _extract_quiz_sentence(query.message.text, "fill", correct_word)
             context_text = quiz_sentence or row.get("context") or ""
@@ -222,9 +240,14 @@ async def _handle_quiz_answer(
             logger.error("更新复习记录失败: %s", exc)
 
         if correct:
+            # 答对时也展示例句翻译，辅助学习
+            quiz_sentence = _extract_quiz_sentence(query.message.text, "fill", correct_word)
+            context_text = quiz_sentence or row.get("context") or ""
+            context_line = await _build_context_line(context_text, correct_word, definition, target_language, native_language)
             level_text = await t_async(f"level_{new_level}", lang)
             feedback = await t_async("quiz_correct", lang,
                                      word=correct_word, definition=definition,
+                                     context_line=context_line,
                                      level=level_text, date=next_review_dt.strftime('%m/%d'))
         else:
             quiz_sentence = _extract_quiz_sentence(query.message.text, "fill", correct_word)
@@ -316,8 +339,13 @@ async def _handle_meaning_answer(
 
     if practice_mode:
         if correct:
+            # 答对时也展示例句翻译，辅助学习
+            quiz_sentence = _extract_quiz_sentence(query.message.text, "meaning", correct_word)
+            context_text = quiz_sentence or row.get("context") or ""
+            context_line = await _build_context_line(context_text, correct_word, definition, target_language, native_language)
             feedback = await t_async("quiz_correct_practice", lang,
-                                     word=correct_word, definition=definition)
+                                     word=correct_word, definition=definition,
+                                     context_line=context_line)
         else:
             quiz_sentence = _extract_quiz_sentence(query.message.text, "meaning", correct_word)
             context_text = quiz_sentence or row.get("context") or ""
@@ -336,9 +364,14 @@ async def _handle_meaning_answer(
             logger.error("更新复习记录失败: %s", exc)
 
         if correct:
+            # 答对时也展示例句翻译，辅助学习
+            quiz_sentence = _extract_quiz_sentence(query.message.text, "meaning", correct_word)
+            context_text = quiz_sentence or row.get("context") or ""
+            context_line = await _build_context_line(context_text, correct_word, definition, target_language, native_language)
             level_text = await t_async(f"level_{new_level}", lang)
             feedback = await t_async("quiz_correct", lang,
                                      word=correct_word, definition=definition,
+                                     context_line=context_line,
                                      level=level_text, date=next_review_dt.strftime('%m/%d'))
         else:
             quiz_sentence = _extract_quiz_sentence(query.message.text, "meaning", correct_word)
@@ -931,7 +964,7 @@ async def _handle_language_callback(
         keyboard = await add_language_keyboard(existing, lang=lang)
         title = await t_async("lang_add_title", lang)
         try:
-            await query.edit_message_text(title, parse_mode="Markdown", reply_markup=keyboard)
+            await query.edit_message_text(title, parse_mode="HTML", reply_markup=keyboard)
         except Exception:
             pass
 
@@ -951,19 +984,55 @@ async def _handle_language_callback(
         keyboard = await native_language_keyboard(current_native, lang=lang)
         title = await t_async("lang_native_title", lang)
         try:
-            await query.edit_message_text(title, parse_mode="Markdown", reply_markup=keyboard)
+            await query.edit_message_text(title, parse_mode="HTML", reply_markup=keyboard)
         except Exception:
             pass
 
     elif action == "set_native":
         lang_code = parts[2] if len(parts) >= 3 else "zh"
+        current_native = settings.get("native_language", "zh")
+        # 相同母语：静默刷新面板，不弹警告
+        if lang_code == current_native:
+            await _refresh_language_panel(query, telegram_id, lang)
+            return
+        # 统计当前母语词库数量，用于警告文案
+        word_count = count_vocab_by_native(telegram_id, current_native)
+        new_display = get_native_language_display(lang_code)
+        current_display = get_native_language_display(current_native)
+        # 警告消息用【当前母语】显示
+        warning = await t_async(
+            "native_switch_warning", lang,
+            current=current_display, count=word_count,
+        )
+        keyboard = await native_switch_confirm_keyboard(lang_code, lang=lang)
+        try:
+            await query.edit_message_text(warning, parse_mode="Markdown",
+                                          reply_markup=keyboard)
+        except Exception:
+            pass
+
+    elif action == "do_native":
+        lang_code = parts[2] if len(parts) >= 3 else "zh"
+        current_native = settings.get("native_language", "zh")
+        # 删除旧母语下的全部词汇
+        deleted = delete_vocab_by_native_language(telegram_id, current_native)
+        # 更新母语设置
         try:
             set_user_languages(telegram_id, native_language=lang_code)
         except Exception as exc:
-            logger.error("设置母语失败: %s", exc)
+            logger.error("切换母语失败: %s", exc)
         if context is not None:
             context.user_data["native_language"] = lang_code
-        # 刷新面板：用新设置的母语
+        new_display = get_native_language_display(lang_code)
+        # 成功消息用【新母语】语言显示
+        done_msg = await t_async(
+            "native_switch_done", lang_code,
+            display=new_display, count=deleted,
+        )
+        try:
+            await query.edit_message_text(done_msg, parse_mode="Markdown")
+        except Exception:
+            pass
         await _refresh_language_panel(query, telegram_id, lang_code)
 
     elif action == "back":
@@ -998,7 +1067,7 @@ async def _refresh_language_panel(query, telegram_id: str, lang: str = "zh") -> 
     keyboard = await language_panel_keyboard(learning_languages, active_language, lang=lang)
 
     try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             logger.error("刷新语言面板失败: %s", e)

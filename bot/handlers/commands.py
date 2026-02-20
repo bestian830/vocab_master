@@ -173,7 +173,7 @@ async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = "\n".join(lines)
     keyboard = await language_panel_keyboard(learning_languages, active_language, lang=lang)
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def cmd_practice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

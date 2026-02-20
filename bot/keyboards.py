@@ -431,3 +431,20 @@ async def native_language_keyboard(
 
     rows.append([InlineKeyboardButton(back_label, callback_data="lang:back")])
     return InlineKeyboardMarkup(rows)
+
+
+async def native_switch_confirm_keyboard(
+    new_code: str, lang: str = "zh"
+) -> InlineKeyboardMarkup:
+    """
+    母语切换确认键盘：确认清空并切换 / 取消
+    callback_data 格式：
+      lang:do_native:{code}  — 确认执行清空+切换
+      lang:native            — 取消，返回母语选择面板
+    """
+    confirm_label = await t_async("native_switch_confirm_btn", lang)
+    cancel_label = await t_async("btn_back", lang)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(confirm_label, callback_data=f"lang:do_native:{new_code}")],
+        [InlineKeyboardButton(cancel_label, callback_data="lang:native")],
+    ])

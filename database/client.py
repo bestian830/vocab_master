@@ -373,6 +373,32 @@ def delete_vocab_by_word(
     return len(result.data) if result.data else 0
 
 
+def count_vocab_by_native(telegram_id: str, native_language: str) -> int:
+    """返回指定用户特定母语下的全部词汇总数（跨所有 target_language）"""
+    db = get_client()
+    result = (
+        db.table("vocab_records")
+        .select("id", count="exact")
+        .eq("telegram_id", telegram_id)
+        .eq("native_language", native_language)
+        .execute()
+    )
+    return result.count or 0
+
+
+def delete_vocab_by_native_language(telegram_id: str, native_language: str) -> int:
+    """删除指定用户特定母语下的全部词汇（跨所有 target_language），返回删除条数"""
+    db = get_client()
+    result = (
+        db.table("vocab_records")
+        .delete()
+        .eq("telegram_id", telegram_id)
+        .eq("native_language", native_language)
+        .execute()
+    )
+    return len(result.data) if result.data else 0
+
+
 def get_level_distribution(telegram_id: str) -> dict[int, int]:
     """返回各级别词汇数量 {level: count}，缺少的级别不在结果中"""
     db = get_client()
