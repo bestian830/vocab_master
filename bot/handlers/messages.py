@@ -12,7 +12,7 @@ from database.client import (
     update_vocab_fields, get_user_settings,
 )
 from config import FREE_WORD_LIMIT, FREE_DAILY_LIMIT
-from bot.keyboards import sentence_vocab_keyboard
+from bot.keyboards import sentence_vocab_keyboard, vocab_confirm_keyboard
 from bot.i18n import t_async
 
 logger = logging.getLogger(__name__)
@@ -221,33 +221,27 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await processing_msg.edit_text(msg, parse_mode="Markdown")
             return
 
-    # 逐一入库，收集结果
+    # 解析结果预览：暂存词汇，等用户点击 Add 才入库
+    msg_id = processing_msg.message_id
+    context.chat_data[f"vc_{msg_id}"] = [
+        {"word": v.word, "pos": v.pos, "definition": v.definition, "context": v.context}
+        for v in result.vocabs
+    ]
+    context.chat_data[f"vc_{msg_id}_lang"] = {
+        "target_language": active_language,
+        "native_language": native_language,
+        "telegram_id": telegram_id,
+    }
+
+    # 构造预览文案（展示每条解析结果）
     lines = []
     for vocab in result.vocabs:
-        try:
-            record, is_new = upsert_vocab(
-                telegram_id=telegram_id,
-                word=vocab.word,
-                pos=vocab.pos,
-                definition=vocab.definition,
-                context=vocab.context,
-                target_language=active_language,
-                native_language=native_language,
-            )
-        except Exception as exc:
-            logger.error("数据库写入失败 (%s): %s", vocab.word, exc)
-            lines.append(f"❌ *{vocab.word}* 保存失败")
-            continue
         pos_tag = f" [{vocab.pos}]" if vocab.pos else ""
-
-        if is_new:
-            lines.append(
-                f"✅ *{vocab.word}* {pos_tag}\n"
-                f"📖 {vocab.definition}\n"
-                f"📝 _{vocab.context}_"
-            )
-        else:
-            lines.append(f"📖 *{vocab.word}* {pos_tag} — {vocab.definition}（已在词库中）")
-
-    reply = "\n\n".join(lines)
-    await processing_msg.edit_text(reply, parse_mode="Markdown")
+        lines.append(
+            f"*{vocab.word}*{pos_tag}\n"
+            f"📖 {vocab.definition}\n"
+            f"📝 _{vocab.context}_"
+        )
+    preview = "\n\n".join(lines)
+    keyboard = await vocab_confirm_keyboard(result.vocabs, msg_id, lang)
+    await processing_msg.edit_text(preview, parse_mode="Markdown", reply_markup=keyboard)

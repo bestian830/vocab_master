@@ -11,7 +11,7 @@ LANGUAGE_META = {
     "es": {"name": "Spanish",     "native_name": "西班牙语",  "flag": "🇪🇸"},
     "ko": {"name": "Korean",      "native_name": "韩语",      "flag": "🇰🇷"},
     "zh": {"name": "Chinese",     "native_name": "中文",      "flag": "🇨🇳"},
-    "pt": {"name": "Portuguese",  "native_name": "葡萄牙语",  "flag": "🇧🇷"},
+    "pt": {"name": "Portuguese",  "native_name": "葡萄牙语",  "flag": "🇵🇹"},
     "it": {"name": "Italian",     "native_name": "意大利语",  "flag": "🇮🇹"},
     "ru": {"name": "Russian",     "native_name": "俄语",      "flag": "🇷🇺"},
 }
@@ -25,7 +25,7 @@ NATIVE_LANGUAGE_META = {
     "fr": {"name": "French (Français)",       "flag": "🇫🇷", "label": "🇫🇷 Français"},
     "de": {"name": "German (Deutsch)",        "flag": "🇩🇪", "label": "🇩🇪 Deutsch"},
     "es": {"name": "Spanish (Español)",       "flag": "🇪🇸", "label": "🇪🇸 Español"},
-    "pt": {"name": "Portuguese (Português)",  "flag": "🇧🇷", "label": "🇧🇷 Português"},
+    "pt": {"name": "Portuguese (Português)",  "flag": "🇵🇹", "label": "🇵🇹 Português"},
     "ru": {"name": "Russian (Русский)",       "flag": "🇷🇺", "label": "🇷🇺 Русский"},
     "it": {"name": "Italian (Italiano)",      "flag": "🇮🇹", "label": "🇮🇹 Italiano"},
 }
@@ -39,7 +39,7 @@ SUPPORTED_TARGET_LANGUAGES = [
     ("🇪🇸 西班牙语 (Spanish)",     "es"),
     ("🇰🇷 韩语 (Korean)",          "ko"),
     ("🇨🇳 中文 (Chinese)",         "zh"),
-    ("🇧🇷 葡萄牙语 (Portuguese)",  "pt"),
+    ("🇵🇹 葡萄牙语 (Portuguese)",  "pt"),
     ("🇮🇹 意大利语 (Italian)",     "it"),
     ("🇷🇺 俄语 (Russian)",         "ru"),
 ]
@@ -53,7 +53,7 @@ SUPPORTED_NATIVE_LANGUAGES = [
     ("🇫🇷 Français",  "fr"),
     ("🇩🇪 Deutsch",   "de"),
     ("🇪🇸 Español",   "es"),
-    ("🇧🇷 Português", "pt"),
+    ("🇵🇹 Português", "pt"),
     ("🇷🇺 Русский",   "ru"),
     ("🇮🇹 Italiano",  "it"),
 ]

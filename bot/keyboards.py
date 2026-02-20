@@ -65,6 +65,29 @@ def sentence_vocab_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
+async def vocab_confirm_keyboard(
+    vocabs: list,
+    msg_id: int,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    """
+    单词入库前确认键盘：每条词汇一行"✅ Add"按钮，底部一个"Skip ❌"按钮。
+    callback_data 格式：
+      vc:add:{msg_id}:{idx}   — 入库指定词汇
+      vc:skip:{msg_id}        — 跳过，不入库
+    """
+    add_label = "✅ Add" if lang != "zh" else "✅ 添加"
+    skip_label = "Skip ❌" if lang != "zh" else "跳过 ❌"
+
+    rows = []
+    for i, vocab in enumerate(vocabs):
+        pos_part = f"  [{vocab.pos}]" if getattr(vocab, "pos", None) else ""
+        btn_label = f"{add_label}  {vocab.word}{pos_part}"
+        rows.append([InlineKeyboardButton(btn_label, callback_data=f"vc:add:{msg_id}:{i}")])
+    rows.append([InlineKeyboardButton(skip_label, callback_data=f"vc:skip:{msg_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def delete_confirm_keyboard(
     records: list[dict],
     lang: str = "zh",
@@ -113,15 +136,12 @@ async def vocab_page_keyboard(
     """
     rows = []
 
-    # 每条词汇的详情按钮（每行两个），显示词 + 词性，点击展开详情消息
+    # 每条词汇的详情按钮（每行一个），显示词 + 词性，点击展开详情消息
     if records:
-        buttons = []
         for r in records:
-            pos_part = f" ({r['pos']})" if r.get("pos") else ""
-            label = f"🔍 {r['word']}{pos_part}"
-            buttons.append(InlineKeyboardButton(label, callback_data=f"vinfo:{r['id']}:{page}"))
-        for i in range(0, len(buttons), 2):
-            rows.append(buttons[i:i + 2])
+            pos_part = f"  [{r['pos']}]" if r.get("pos") else ""
+            label = f"{r['word']}{pos_part}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"vinfo:{r['id']}:{page}")])
 
     # 分页导航按钮
     if total_pages > 1:
@@ -411,3 +431,20 @@ async def native_language_keyboard(
 
     rows.append([InlineKeyboardButton(back_label, callback_data="lang:back")])
     return InlineKeyboardMarkup(rows)
+
+
+async def native_switch_confirm_keyboard(
+    new_code: str, lang: str = "zh"
+) -> InlineKeyboardMarkup:
+    """
+    母语切换确认键盘：确认清空并切换 / 取消
+    callback_data 格式：
+      lang:do_native:{code}  — 确认执行清空+切换
+      lang:native            — 取消，返回母语选择面板
+    """
+    confirm_label = await t_async("native_switch_confirm_btn", lang)
+    cancel_label = await t_async("btn_back", lang)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(confirm_label, callback_data=f"lang:do_native:{new_code}")],
+        [InlineKeyboardButton(cancel_label, callback_data="lang:native")],
+    ])

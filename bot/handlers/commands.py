@@ -12,6 +12,8 @@ from telegram.ext import ContextTypes
 
 from datetime import datetime, timezone
 
+import random
+
 from database.client import (
     get_vocab_list, count_vocab, get_due_vocab,
     is_pro, get_subscription, get_today_add_count,
@@ -21,6 +23,7 @@ from database.client import (
     get_streak, check_db_connection,
     get_all_user_ids, get_admin_stats, get_vocab_detail,
     has_user_settings, get_vocab_count_by_language,
+    get_practice_vocab,
 )
 from config import ADMIN_TELEGRAM_ID, FREE_WORD_LIMIT, FREE_DAILY_LIMIT
 from core.quiz import build_quiz
@@ -170,7 +173,7 @@ async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = "\n".join(lines)
     keyboard = await language_panel_keyboard(learning_languages, active_language, lang=lang)
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def cmd_practice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -209,9 +212,24 @@ async def cmd_practice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(msg)
     context.user_data["active_session"] = "practice"
 
+    # 构建 shuffle 队列：取全部词汇后随机打乱，逐题 pop 出题
+    all_vocab = get_practice_vocab(
+        telegram_id, target_language=active_language, native_language=native_language
+    )
+    if not all_vocab:
+        context.user_data.pop("active_session", None)
+        err = await t_async("practice_error", lang)
+        await update.message.reply_text(err)
+        return
+    random.shuffle(all_vocab)
+    context.user_data["practice_queue"] = all_vocab
+
+    # 取队首出第一题
+    first_vocab = context.user_data["practice_queue"].pop(0)
     question = await build_quiz(
         telegram_id, practice_mode=True,
-        target_language=active_language, native_language=native_language
+        target_language=active_language, native_language=native_language,
+        force_vocab=first_vocab,
     )
     if not question:
         context.user_data.pop("active_session", None)
@@ -383,12 +401,13 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/delete <word> — 从词库中删除指定单词；含逗号时批量删除"""
+    """/delete <word> — 从当前激活语言词库中删除指定单词；含逗号时批量删除"""
     from database.client import delete_vocab_by_word as _delete_by_word
 
     telegram_id = str(update.effective_user.id)
     settings = get_user_settings(telegram_id)
     lang = settings.get("native_language", "zh")
+    active_language = settings.get("active_language", "en")
 
     if not context.args:
         await update.message.reply_text(
@@ -400,11 +419,11 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     raw = " ".join(context.args).strip()
 
-    # 先查整体短语是否存在
+    # 先查整体短语是否存在（限制在当前激活语言）
     word = raw
-    records = get_vocab_by_word(telegram_id, word)
+    records = get_vocab_by_word(telegram_id, word, target_language=active_language)
 
-    # 整体短语不存在 + 多个 token → 批量删除
+    # 整体短语不存在 + 多个 token → 批量删除（同样限制语言）
     if not records and len(context.args) > 1:
         if "," in raw:
             tokens = [t.strip() for t in raw.split(",") if t.strip()]
@@ -413,7 +432,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         batch_title = await t_async("delete_batch_title", lang)
         lines = [batch_title]
         for token in tokens:
-            count = _delete_by_word(telegram_id, token)
+            count = _delete_by_word(telegram_id, token, target_language=active_language)
             if count > 0:
                 lines.append(await t_async("delete_batch_ok", lang, word=token, count=count))
             else:
