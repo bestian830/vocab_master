@@ -222,20 +222,16 @@ async def vocab_detail_keyboard(
     lang: str = "zh",
 ) -> InlineKeyboardMarkup:
     """
-    词汇详情页键盘：三个编辑按钮 + 返回词库按钮
+    词汇详情页键盘：讲词按钮 + 返回词库按钮
     callback_data 格式：
-      vedit:{record_id}:{field}:{page}  — 进入字段编辑
-      vocab_page:{page}                 — 返回词库列表
+      explain:{record_id}:{page}  — 触发 AI 讲词
+      vocab_page:{page}           — 返回词库列表
     """
-    pos_label = await t_async("btn_edit_pos", lang)
-    def_label = await t_async("btn_edit_def", lang)
-    ctx_label = await t_async("btn_edit_ctx", lang)
+    explain_label = "📚 讲词" if lang == "zh" else "📚 Explain"
     back_label = await t_async("btn_back_vocab", lang)
 
     row1 = [
-        InlineKeyboardButton(pos_label, callback_data=f"vedit:{record_id}:pos:{page}"),
-        InlineKeyboardButton(def_label, callback_data=f"vedit:{record_id}:definition:{page}"),
-        InlineKeyboardButton(ctx_label, callback_data=f"vedit:{record_id}:context:{page}"),
+        InlineKeyboardButton(explain_label, callback_data=f"explain:{record_id}:{page}"),
     ]
     row2 = [
         InlineKeyboardButton(back_label, callback_data=f"vocab_page:{page}"),
@@ -448,3 +444,126 @@ async def native_switch_confirm_keyboard(
         [InlineKeyboardButton(confirm_label, callback_data=f"lang:do_native:{new_code}")],
         [InlineKeyboardButton(cancel_label, callback_data="lang:native")],
     ])
+
+
+def assessment_keyboard(
+    batch_idx: int,
+    words: list[str],
+    selections: set[int],
+    is_last_batch: bool = False,
+) -> InlineKeyboardMarkup:
+    """
+    词汇评估键盘：8 个可 toggle 的词汇按钮（2列×4行）+ 下一组/完成按钮。
+    已选词显示 ✓ 前缀，未选词显示 □ 前缀。
+    callback_data 格式：
+      assess_toggle:{batch_idx}:{word_idx}  — 切换词汇选中状态
+      assess_next:{batch_idx}               — 前往下一组（batch 1-4）
+      assess_done                            — 完成评估（batch 5）
+    """
+    rows = []
+    # 每行 2 个词，共 4 行
+    for i in range(0, len(words), 2):
+        row = []
+        for j in range(2):
+            word_idx = i + j
+            if word_idx >= len(words):
+                break
+            word = words[word_idx]
+            prefix = "✓ " if word_idx in selections else "□ "
+            row.append(InlineKeyboardButton(
+                f"{prefix}{word}",
+                callback_data=f"assess_toggle:{batch_idx}:{word_idx}",
+            ))
+        rows.append(row)
+
+    # 最后一行：下一组 or 完成
+    if is_last_batch:
+        rows.append([InlineKeyboardButton("✅ 完成测评", callback_data="assess_done")])
+    else:
+        rows.append([InlineKeyboardButton(
+            f"下一组 → ({batch_idx + 1}/5)",
+            callback_data=f"assess_next:{batch_idx}",
+        )])
+    return InlineKeyboardMarkup(rows)
+
+
+def level_select_keyboard() -> InlineKeyboardMarkup:
+    """
+    非英语语言 onboarding 时的自选词汇水平键盘（4 个选项）。
+    callback_data = level_set:{level}
+    """
+    levels = [
+        (1, "初学 / Beginner"),
+        (2, "基础 / Elementary"),
+        (3, "进阶 / Intermediate"),
+        (4, "高级+ / Advanced"),
+    ]
+    rows = []
+    for level, label in levels:
+        rows.append([InlineKeyboardButton(label, callback_data=f"level_set:{level}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def proficiency_keyboard(current_level: int = 0) -> InlineKeyboardMarkup:
+    """
+    /level 命令的词汇水平选择键盘（5 个选项）。
+    当前等级标注 ✅，callback_data = level_set:{level}
+    """
+    levels = [
+        (1, "Level 1 — 初学 (A2)"),
+        (2, "Level 2 — 基础 (B1)"),
+        (3, "Level 3 — 进阶 (B2)"),
+        (4, "Level 4 — 高级 (C1)"),
+        (5, "Level 5 — 专家 (C2)"),
+    ]
+    rows = []
+    for level, label in levels:
+        display = f"✅ {label}" if level == current_level else label
+        rows.append([InlineKeyboardButton(display, callback_data=f"level_set:{level}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def synonym_quiz_keyboard(
+    options: list[str],
+    record_id: str,
+    practice_mode: bool = False,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    """
+    同义词辨析题键盘：4 个选项（2行×2列）+ 跳过 + 结束按钮。
+    callback_data 格式：qs:{record_id}:{idx} 或 qsp:{record_id}:{idx}（练习模式）
+    """
+    prefix = "qsp" if practice_mode else "qs"
+    skip_label = await t_async("btn_skip", lang)
+    end_label = await t_async("btn_end_practice" if practice_mode else "btn_end_review", lang)
+
+    row1 = [
+        InlineKeyboardButton(options[0], callback_data=f"{prefix}:{record_id}:0"),
+        InlineKeyboardButton(options[1], callback_data=f"{prefix}:{record_id}:1"),
+    ]
+    row2 = [
+        InlineKeyboardButton(options[2], callback_data=f"{prefix}:{record_id}:2"),
+        InlineKeyboardButton(options[3], callback_data=f"{prefix}:{record_id}:3"),
+    ]
+    row3 = [InlineKeyboardButton(skip_label, callback_data=f"{prefix}:{record_id}:skip")]
+    end_prefix = "qend:p" if practice_mode else "qend:r"
+    row4 = [InlineKeyboardButton(end_label, callback_data=end_prefix)]
+    return InlineKeyboardMarkup([row1, row2, row3, row4])
+
+
+async def generation_quiz_keyboard(
+    record_id: str,
+    practice_mode: bool = False,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    """
+    造句题键盘：只有跳过按钮和结束按钮（用户直接在聊天框输入句子）。
+    callback_data：gen_skip:{record_id}
+    """
+    skip_label = await t_async("btn_skip", lang)
+    end_label = await t_async("btn_end_practice" if practice_mode else "btn_end_review", lang)
+
+    row1 = [InlineKeyboardButton(skip_label, callback_data=f"gen_skip:{record_id}")]
+    end_prefix = "qend:p" if practice_mode else "qend:r"
+    row2 = [InlineKeyboardButton(end_label, callback_data=end_prefix)]
+    return InlineKeyboardMarkup([row1, row2])

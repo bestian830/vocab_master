@@ -9,9 +9,11 @@ load_dotenv()
 # Telegram
 TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 
-# Supabase
-SUPABASE_URL: str = os.environ["SUPABASE_URL"]
-SUPABASE_ANON_KEY: str = os.environ["SUPABASE_ANON_KEY"]
+# 数据库（本地 PostgreSQL via SQLAlchemy）
+DATABASE_URL: str = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:password@localhost:5432/vocab_master"
+)
 
 # AI 服务 (兼容 OpenAI 接口规范)
 DEEPSEEK_API_KEY: str = os.environ["DEEPSEEK_API_KEY"]

@@ -10,6 +10,14 @@ Vocab Master is an intelligent English vocabulary assistant on Telegram. Unlike 
 
 ## 📋 Recent Updates
 
+### v0.4 — Stability & Pro Features (2026-02)
+- **Database migration**: Migrated from Supabase to self-hosted PostgreSQL + SQLAlchemy 2.0 for full data control and Railway deployment compatibility.
+- **Concurrent update handling**: Added `concurrent_updates=True` and 60s AI timeout to prevent event loop blocking when AI API is slow.
+- **Pro subscription system**: Activation codes (`/activate`), quota management, admin commands (`/gencode`, `/broadcast`, `/users`, `/health`).
+- **Rich vocabulary metadata**: Words now store etymology, synonyms, antonyms, word family, and collocations for richer quiz experiences.
+- **AI teach feature**: `/vocab` detail view includes an "AI Explain" button for deep contextual teaching.
+- **Bug fixes**: Fill-in-the-blank phrase duplication, practice queue edge cases, vocab layout, add confirmation dialog, native language switch warning.
+
 ### v0.3 — Multi-Language & Vocab Isolation (2026-02)
 - **Multi-language learning**: Users can study multiple target languages simultaneously and switch the active language via `/language`. Each language has its own independent word list.
 - **Vocab isolation by native language**: The vocab book is now isolated by `(target_language × native_language)`. Users studying English with Chinese vs. Japanese annotations maintain completely separate books — quiz distractors will never mix across native languages.
@@ -48,10 +56,10 @@ Built-in improved SM-2 Spaced Repetition Algorithm that dynamically adjusts revi
 This project adopts a modern Serverless architecture designed for stability and low latency under high concurrency.
 
 - **Bot Framework**: `python-telegram-bot` (Async Mode)
-- **Database**: PostgreSQL (Supabase) + Vector Search (Planned)
+- **Database**: PostgreSQL (本地/Railway) + SQLAlchemy 2.0
 - **Job Queue**: APScheduler (Distributed Locking)
 - **AI Core**: DeepSeek / OpenAI API (Custom Prompt Engineering)
-- **Deployment**: Koyeb (Webhook Mode)
+- **Deployment**: Railway (Webhook Mode)
 
 ### Core Module Design
 1. **Scheduler Service**: A distributed task scheduler handling concurrent review notifications per `(user × target_language × native_language)` triplet.
@@ -76,9 +84,19 @@ Copyright © 2026 Ryan (bestian830). All Rights Reserved.
 
 ## 📅 Roadmap
 
-The project is currently in **Beta**. Future updates will include:
+The project is currently in **Beta (v0.4)**. Planned development:
 
-- [ ] **Multimodal Memory**: Integrating TTS voice generation and AI image association.
+### Near-term
+- [ ] **Dictionary API Integration**: Connect to authoritative dictionaries (e.g., Merriam-Webster, Oxford) to get canonical definitions and resolve polysemy issues — AI-generated sentences will be grounded in the correct word sense.
+- [ ] **Polysemy Handling**: When a word has multiple senses, users can specify which meaning they want to learn, and quiz sentences will target that exact sense.
+- [ ] **Multimodal Memory**: TTS voice generation and AI image association for audio-visual learners.
+
+### Web Version (面向中国学习者)
+- [ ] **Web Dashboard**: A responsive web app (React/Next.js) where users can manage their vocabulary, review progress, and configure settings — no Telegram required.
+- [ ] **WeChat Mini Program**: A native mini-program targeting Chinese learners, with WeChat login and offline support.
+- [ ] **Cross-platform sync**: Telegram Bot, Web, and Mini Program share the same backend and vocabulary data.
+
+### Long-term
 - [ ] **Social Battles**: Group-based vocabulary PK systems.
 - [ ] **Anki Ecosystem**: Two-way synchronization support for `.apkg` format.
 

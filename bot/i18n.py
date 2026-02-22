@@ -116,6 +116,9 @@ STRINGS: dict[str, dict[str, str]] = {
         ),
         "session_mode_review": "复习",
         "session_mode_practice": "练习",
+        "pending_quiz_exists": (
+            "⏳ 你有一道题正在等待作答，请先回答（或等待15分钟后自动关闭）。"
+        ),
 
         # ── 词库 ─────────────────────────────────────────────────────────────
         "vocab_empty": (
