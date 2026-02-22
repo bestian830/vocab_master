@@ -5,6 +5,7 @@ import io
 import csv
 import math
 import logging
+import time
 import html as html_lib
 
 from telegram import Update
@@ -23,7 +24,7 @@ from database.client import (
     get_streak, check_db_connection,
     get_all_user_ids, get_admin_stats, get_vocab_detail,
     has_user_settings, get_vocab_count_by_language,
-    get_practice_vocab,
+    get_practice_vocab, set_proficiency_level,
 )
 from config import ADMIN_TELEGRAM_ID, FREE_WORD_LIMIT, FREE_DAILY_LIMIT
 from core.quiz import build_quiz
@@ -33,6 +34,7 @@ from bot.keyboards import (
     quiz_keyboard, vocab_page_keyboard, delete_confirm_keyboard,
     timezone_keyboard, vocab_detail_keyboard, settings_panel_keyboard,
     language_panel_keyboard, onboarding_native_keyboard,
+    synonym_quiz_keyboard, generation_quiz_keyboard, proficiency_keyboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,8 +79,11 @@ def _vocab_line(r: dict) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/start — 欢迎消息 + 使用说明；新用户自动引导时区设置"""
     telegram_id = str(update.effective_user.id)
+    # 先判断是否新用户，避免重复查询
+    is_new_user = not has_user_settings(telegram_id)
     settings = get_user_settings(telegram_id)
-    lang = settings.get("native_language", "zh")
+    # 新用户尚未设置母语，默认用英文展示 onboarding（选完母语后才切换）
+    lang = "en" if is_new_user else settings.get("native_language", "zh")
 
     welcome = await t_async("start_welcome", lang)
     help_text = await t_async("help_text", lang)
@@ -86,9 +91,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode="Markdown")
 
     # 新用户：启动引导流程（选母语 → 选学习语言 → 选时区 → 完成）
-    if not has_user_settings(telegram_id):
-        msg = await t_async("onboard_native_title", "zh")   # 默认 zh，用户尚未设置
-        keyboard = await onboarding_native_keyboard("zh")
+    if is_new_user:
+        msg = await t_async("onboard_native_title", "en")
+        keyboard = await onboarding_native_keyboard("en")
         await update.message.reply_text(msg, reply_markup=keyboard)
 
 
@@ -191,6 +196,26 @@ async def cmd_practice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(msg)
         return
 
+    # 防止重复推题：15 分钟内有未回答的 pending quiz 时拦截
+    from scheduler.reminder import _pending_quiz, QUIZ_PENDING_TIMEOUT as _QUIZ_TIMEOUT
+    if telegram_id in _pending_quiz:
+        msg_id, ts = _pending_quiz[telegram_id]
+        if time.time() - ts < _QUIZ_TIMEOUT:
+            settings = get_user_settings(telegram_id)
+            lang = settings.get("native_language", "zh")
+            msg = await t_async("pending_quiz_exists", lang)
+            await update.message.reply_text(msg)
+            return
+        else:
+            # 超时：移除旧题按钮，清除记录，允许继续
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=telegram_id, message_id=msg_id, reply_markup=None
+                )
+            except Exception:
+                pass
+            del _pending_quiz[telegram_id]
+
     # 读取语言设置并存入 user_data
     settings = get_user_settings(telegram_id)
     active_language = settings.get("active_language", "en")
@@ -211,6 +236,7 @@ async def cmd_practice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     msg = await t_async("practice_start", lang, lang_name=lang_display)
     await update.message.reply_text(msg)
     context.user_data["active_session"] = "practice"
+    context.user_data["active_session_ts"] = time.time()
 
     # 构建 shuffle 队列：取全部词汇后随机打乱，逐题 pop 出题
     all_vocab = get_practice_vocab(
@@ -236,7 +262,9 @@ async def cmd_practice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         err = await t_async("practice_error", lang)
         await update.message.reply_text(err)
         return
-    await _send_quiz(update.message.reply_text, question, lang=lang)
+    sent = await _send_quiz(update.message.reply_text, question, lang=lang, context=context)
+    if sent is not None:
+        context.user_data["last_quiz_msg_id"] = sent.message_id
 
 
 async def cmd_vocab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -299,6 +327,26 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(msg)
         return
 
+    # 防止重复推题：15 分钟内有未回答的 pending quiz 时拦截
+    from scheduler.reminder import _pending_quiz, QUIZ_PENDING_TIMEOUT as _QUIZ_TIMEOUT
+    if telegram_id in _pending_quiz:
+        msg_id, ts = _pending_quiz[telegram_id]
+        if time.time() - ts < _QUIZ_TIMEOUT:
+            settings = get_user_settings(telegram_id)
+            lang = settings.get("native_language", "zh")
+            msg = await t_async("pending_quiz_exists", lang)
+            await update.message.reply_text(msg)
+            return
+        else:
+            # 超时：移除旧题按钮，清除记录，允许继续
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=telegram_id, message_id=msg_id, reply_markup=None
+                )
+            except Exception:
+                pass
+            del _pending_quiz[telegram_id]
+
     # 读取语言设置并存入 user_data（供后续 callback 使用）
     settings = get_user_settings(telegram_id)
     active_language = settings.get("active_language", "en")
@@ -321,6 +369,7 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         msg = await t_async("review_no_due_practice", lang, lang_name=lang_display)
         await update.message.reply_text(msg)
         context.user_data["active_session"] = "practice"
+        context.user_data["active_session_ts"] = time.time()
         question = await build_quiz(
             telegram_id, practice_mode=True,
             target_language=active_language, native_language=native_language
@@ -330,13 +379,16 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             err = await t_async("review_error", lang)
             await update.message.reply_text(err)
             return
-        await _send_quiz(update.message.reply_text, question, lang=lang)
+        sent = await _send_quiz(update.message.reply_text, question, lang=lang, context=context)
+        if sent is not None:
+            context.user_data["last_quiz_msg_id"] = sent.message_id
         return
 
     # 生成正式复习题
     gen_msg = await t_async("review_generating", lang, lang_name=lang_display)
     await update.message.reply_text(gen_msg)
     context.user_data["active_session"] = "review"
+    context.user_data["active_session_ts"] = time.time()
     question = await build_quiz(
         telegram_id, target_language=active_language, native_language=native_language
     )
@@ -347,7 +399,9 @@ async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(err)
         return
 
-    await _send_quiz(update.message.reply_text, question, lang=lang)
+    sent = await _send_quiz(update.message.reply_text, question, lang=lang, context=context)
+    if sent is not None:
+        context.user_data["last_quiz_msg_id"] = sent.message_id
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -805,7 +859,7 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def _format_vocab_detail(record: dict, lang: str = "zh") -> str:
-    """将完整词汇记录格式化为详情消息文本（Markdown），支持多语言"""
+    """将完整词汇记录格式化为详情消息文本（Markdown），支持多语言。展示富词汇元数据。"""
     word = record.get("word", "")
     pos = record.get("pos", "")
     definition = record.get("definition", "")
@@ -813,11 +867,33 @@ async def _format_vocab_detail(record: dict, lang: str = "zh") -> str:
     level = record.get("level", 0)
     review_count = record.get("review_count", 0)
     next_review = record.get("next_review", "")
+    # 富词汇元数据
+    etymology    = record.get("etymology") or ""
+    antonyms     = record.get("antonyms") or []
+    word_family  = record.get("word_family") or []
+    quiz_synonyms = record.get("quiz_synonyms") or []
+    collocations = record.get("collocations") or []
+    word_level   = record.get("word_level")
 
     pos_tag = f"[{pos}] " if pos else ""
     lines = [f"📖 *{word}*", f"{pos_tag}{definition}"]
     if context_sentence:
         lines.append(f"📝 _{context_sentence}_")
+
+    # 富词汇元数据展示（有数据才显示）
+    if etymology:
+        lines.append(f"🌱 *词源：* {etymology}")
+    if quiz_synonyms and quiz_synonyms[0]:
+        lines.append(f"≈ *同义词：* {quiz_synonyms[0]}")
+    if antonyms:
+        lines.append(f"↔ *反义词：* {', '.join(antonyms)}")
+    if word_family:
+        lines.append(f"🔤 *词族：* {', '.join(word_family)}")
+    if collocations:
+        lines.append(f"🔗 *搭配：* {', '.join(collocations)}")
+    if word_level:
+        level_stars = "★" * word_level + "☆" * (5 - word_level)
+        lines.append(f"📊 *难度：* {level_stars} Level {word_level}")
 
     # 复习进度信息（使用 i18n）
     review_label = await t_async("edit_detail_review", lang, count=review_count)
@@ -832,6 +908,28 @@ async def _format_vocab_detail(record: dict, lang: str = "zh") -> str:
     lines.append("_" + " | ".join(meta_parts) + "_")
 
     return "\n".join(lines)
+
+
+async def cmd_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/level — 查看当前词汇水平并手动调整（1-5 级）"""
+    from core.assessment import get_level_name
+    telegram_id = str(update.effective_user.id)
+    settings = get_user_settings(telegram_id)
+    lang = settings.get("native_language", "zh")
+    current_level = settings.get("proficiency_level", 0)
+
+    if current_level == 0:
+        level_desc = "尚未评估"
+    else:
+        level_desc = get_level_name(current_level, lang)
+
+    text = (
+        f"📊 *词汇水平设置*\n\n"
+        f"当前等级：**Level {current_level}** — {level_desc}\n\n"
+        f"选择你的词汇水平（影响句子分析时的词汇推荐难度）："
+    )
+    keyboard = proficiency_keyboard(current_level)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -894,17 +992,20 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def _send_quiz(send_fn, question, lang: str = "zh") -> None:
-    """发送一道测验题（可被命令和调度器复用），根据题型组装不同文案，支持多语言"""
-    keyboard = await quiz_keyboard(
-        question.options,
-        question.record_id,
-        quiz_type=question.quiz_type,
-        practice_mode=question.practice_mode,
-        lang=lang,
-    )
-
+async def _send_quiz(send_fn, question, lang: str = "zh", context=None):
+    """
+    发送一道测验题（可被命令和调度器复用），根据题型组装不同文案，支持多语言。
+    context: Telegram ContextTypes，generation 题需要用来设置 pending_generation 状态。
+    返回值：发送成功的 Message 对象（供调度器记录 message_id 用），失败或无匹配题型时返回 None。
+    """
     if question.quiz_type == "meaning":
+        keyboard = await quiz_keyboard(
+            question.options,
+            question.record_id,
+            quiz_type="meaning",
+            practice_mode=question.practice_mode,
+            lang=lang,
+        )
         title = await t_async("quiz_meaning_title", lang)
         instruction = await t_async("quiz_meaning_instruction", lang, word=question.word)
         text = (
@@ -913,8 +1014,16 @@ async def _send_quiz(send_fn, question, lang: str = "zh") -> None:
             f'"{question.sentence}"\n\n'
             f"{instruction}"
         )
-        await send_fn(text, parse_mode="Markdown", reply_markup=keyboard)
-    else:
+        return await send_fn(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    elif question.quiz_type == "fill":
+        keyboard = await quiz_keyboard(
+            question.options,
+            question.record_id,
+            quiz_type="fill",
+            practice_mode=question.practice_mode,
+            lang=lang,
+        )
         # 填空题：用 HTML 格式，避免下划线被 Markdown 当成斜体符号解析
         safe_sentence = html_lib.escape(question.sentence).replace("______", "<b>______</b>")
         safe_def = html_lib.escape(question.definition)
@@ -927,4 +1036,68 @@ async def _send_quiz(send_fn, question, lang: str = "zh") -> None:
             f"<i>{safe_sentence}</i>\n\n"
             f"{hint}"
         )
-        await send_fn(text, parse_mode="HTML", reply_markup=keyboard)
+        return await send_fn(text, parse_mode="HTML", reply_markup=keyboard)
+
+    elif question.quiz_type == "synonym":
+        keyboard = await synonym_quiz_keyboard(
+            question.options,
+            question.record_id,
+            practice_mode=question.practice_mode,
+            lang=lang,
+        )
+        safe_sentence = html_lib.escape(question.sentence)
+        safe_def = html_lib.escape(question.definition)
+        text = (
+            f"🔀 <b>同义词辨析</b>\n\n"
+            f"<i>\"{safe_sentence}\"</i>\n\n"
+            f"哪个词与 <b>{question.word}</b>（{safe_def}）意思最接近？"
+        )
+        return await send_fn(text, parse_mode="HTML", reply_markup=keyboard)
+
+    elif question.quiz_type == "reverse":
+        # 反向选词：给母语释义，选出目标语言单词；复用 fill 的 callback 前缀
+        keyboard = await quiz_keyboard(
+            question.options,
+            question.record_id,
+            quiz_type="fill",
+            practice_mode=question.practice_mode,
+            lang=lang,
+        )
+        safe_def = html_lib.escape(question.definition)
+        text_parts = [f"🔄 <b>反向选词</b>\n\n「{safe_def}」"]
+        if question.sentence:
+            safe_sentence = html_lib.escape(question.sentence)
+            text_parts.append(f"<i>{safe_sentence}</i>")
+        text_parts.append("根据释义，选出正确的单词：")
+        text = "\n\n".join(text_parts)
+        return await send_fn(text, parse_mode="HTML", reply_markup=keyboard)
+
+    elif question.quiz_type == "generation":
+        # 设置 pending_generation 状态，等待用户下一条文本消息
+        if context is not None:
+            context.user_data["pending_generation"] = {
+                "record_id": str(question.record_id),
+                "word": question.word,
+                "definition": question.definition,
+                "target_language": question.target_language,
+                "native_language": question.native_language,
+                "practice_mode": question.practice_mode,
+                "ease_factor": question.ease_factor,
+                "current_level": question.level,
+                "retry_count": 0,
+            }
+        keyboard = await generation_quiz_keyboard(
+            question.record_id,
+            practice_mode=question.practice_mode,
+            lang=lang,
+        )
+        safe_def = html_lib.escape(question.definition)
+        safe_ref = html_lib.escape(question.sentence)
+        text = (
+            f"✍️ <b>造句练习</b>\n\n"
+            f"请用 <b>{question.word}</b> 造一个句子：\n"
+            f"「{safe_def}」\n\n"
+            f"<i>参考例句：{safe_ref}</i>\n\n"
+            f"直接在聊天框输入你的句子 👇"
+        )
+        return await send_fn(text, parse_mode="HTML", reply_markup=keyboard)

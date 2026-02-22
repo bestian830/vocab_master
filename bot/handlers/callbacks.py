@@ -4,12 +4,13 @@ Inline button 回调处理器：测验答题 + 词库翻页 + 多语言管理
 import logging
 import math
 import re
+import time
 
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
-from ai.parser import generate_example_sentence, translate_to_native
+from ai.parser import generate_example_sentence, translate_to_native, explain_word_for_teaching
 from core.sm2 import next_level_and_review, format_next_review
 from core.language import get_language_display, get_native_language_display
 from database.client import (
@@ -19,16 +20,19 @@ from database.client import (
     update_remind_window, set_remind_enabled, get_vocab_count_by_language,
     set_user_languages, add_learning_language,
     count_vocab_by_native, delete_vocab_by_native_language,
+    set_proficiency_level,
 )
 from config import FREE_WORD_LIMIT, FREE_DAILY_LIMIT
 from core.quiz import build_quiz
 from bot.i18n import t_async
 from bot.keyboards import (
     quiz_keyboard, vocab_page_keyboard, sentence_vocab_keyboard,
-    vocab_detail_keyboard, edit_field_keyboard, settings_panel_keyboard,
+    vocab_detail_keyboard, settings_panel_keyboard,
     remind_window_keyboard, language_panel_keyboard, add_language_keyboard,
     native_language_keyboard, onboarding_lang_keyboard, timezone_keyboard,
     vocab_confirm_keyboard, native_switch_confirm_keyboard,
+    assessment_keyboard, level_select_keyboard, synonym_quiz_keyboard,
+    proficiency_keyboard,
 )
 import random as _random
 from bot.handlers.commands import _send_quiz, _vocab_line
@@ -89,18 +93,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data: str = query.data
     telegram_id = str(update.effective_user.id)
 
-    # vinfo / vedit / tz / settings / lang 回调单独处理（需要访问 context，内部自行 answer）
+    # vinfo / explain / tz / settings / lang 回调单独处理（需要访问 context，内部自行 answer）
     if data.startswith("vinfo:"):
         await _handle_vocab_info(query, data, context)
         return
-    elif data.startswith("vedit:"):
-        await _handle_vocab_edit(query, telegram_id, data, context)
-        return
-    elif data.startswith("vedit_sel:"):
-        await _handle_vocab_edit_select(query, data, context)
-        return
-    elif data.startswith("vedit_cancel:"):
-        await _handle_vocab_edit_cancel(query, telegram_id, data, context)
+    elif data.startswith("explain:"):
+        await _handle_explain_word(query, telegram_id, data, context)
         return
     elif data.startswith("tz:"):
         await _handle_timezone_select(query, telegram_id, data, context)
@@ -120,6 +118,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("vc:"):
         await _handle_vocab_confirm(query, telegram_id, data, context)
         return
+    elif data.startswith("assess_toggle:"):
+        await _handle_assess_toggle(query, telegram_id, data, context)
+        return
+    elif data.startswith("assess_next:"):
+        await _handle_assess_next(query, telegram_id, data, context)
+        return
+    elif data == "assess_done":
+        await _handle_assess_done(query, telegram_id, context)
+        return
+    elif data.startswith("level_set:"):
+        await _handle_level_set(query, telegram_id, data, context)
+        return
 
     await query.answer()
 
@@ -131,6 +141,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _handle_quiz_answer(query, telegram_id, data, practice_mode=True, context=context)
     elif data.startswith("qmp:"):
         await _handle_meaning_answer(query, telegram_id, data, practice_mode=True, context=context)
+    elif data.startswith("qs:"):
+        await _handle_synonym_answer(query, telegram_id, data, context=context)
+    elif data.startswith("qsp:"):
+        await _handle_synonym_answer(query, telegram_id, data, practice_mode=True, context=context)
+    elif data.startswith("gen_skip:"):
+        await _handle_gen_skip(query, telegram_id, data, context)
     elif data.startswith("vocab_page:"):
         await _handle_vocab_page(query, telegram_id, data, context)
     elif data.startswith("sa:"):
@@ -153,6 +169,22 @@ async def _handle_quiz_answer(
     practice_mode=True 时不更新 DB，反馈不显示级别变化
     从 vocab_record 读取 native_language 决定反馈语言
     """
+    # 防止 Telegram 重试导致的重复处理（网络断线重传场景）
+    if context is not None:
+        answered_msgs: set = context.user_data.setdefault("answered_msgs", set())
+        _msg_id = query.message.message_id
+        if _msg_id in answered_msgs:
+            await query.answer()
+            return
+        answered_msgs.add(_msg_id)
+
+    # 用户已回答，清除调度器推送记录，允许下次继续推送
+    try:
+        from scheduler.reminder import _pending_quiz
+        _pending_quiz.pop(telegram_id, None)
+    except Exception:
+        pass
+
     parts = data.split(":", 2)
     if len(parts) != 3:
         return
@@ -165,21 +197,11 @@ async def _handle_quiz_answer(
         for btn in row
     ]
 
-    from database.client import get_client
-    db = get_client()
-    rows = (
-        db.table("vocab_records")
-        .select("word,level,definition,context,ease_factor,target_language,native_language")
-        .eq("id", record_id)
-        .limit(1)
-        .execute()
-        .data
-    )
-    if not rows:
+    row = get_vocab_detail(record_id)
+    if not row:
         await query.edit_message_text(await t_async("vocab_record_not_found", "zh"))
         return
 
-    row = rows[0]
     correct_word = row["word"]
     current_level = row["level"]
     definition = row["definition"]
@@ -277,26 +299,32 @@ async def _handle_meaning_answer(
     callback_data 格式: qm:{record_id}:{option_index|skip}
     用户选择母语释义，与数据库中的 definition 比对判断正误
     """
+    # 防止 Telegram 重试导致的重复处理（网络断线重传场景）
+    if context is not None:
+        answered_msgs: set = context.user_data.setdefault("answered_msgs", set())
+        _msg_id = query.message.message_id
+        if _msg_id in answered_msgs:
+            await query.answer()
+            return
+        answered_msgs.add(_msg_id)
+
+    # 用户已回答，清除调度器推送记录，允许下次继续推送
+    try:
+        from scheduler.reminder import _pending_quiz
+        _pending_quiz.pop(telegram_id, None)
+    except Exception:
+        pass
+
     parts = data.split(":", 2)
     if len(parts) != 3:
         return
     _, record_id, choice = parts
 
-    from database.client import get_client
-    db = get_client()
-    rows = (
-        db.table("vocab_records")
-        .select("word,level,definition,context,ease_factor,target_language,native_language")
-        .eq("id", record_id)
-        .limit(1)
-        .execute()
-        .data
-    )
-    if not rows:
+    row = get_vocab_detail(record_id)
+    if not row:
         await query.edit_message_text(await t_async("vocab_record_not_found", "zh"))
         return
 
-    row = rows[0]
     correct_word = row["word"]
     current_level = row["level"]
     definition = row["definition"]
@@ -481,6 +509,12 @@ async def _handle_sentence_add(query, telegram_id: str, data: str, context) -> N
             context=vocab["context"],
             target_language=target_language,
             native_language=native_language,
+            word_level=vocab.get("word_level"),
+            quiz_synonyms=vocab.get("quiz_synonyms"),
+            antonyms=vocab.get("antonyms"),
+            word_family=vocab.get("word_family"),
+            etymology=vocab.get("etymology"),
+            collocations=vocab.get("collocations"),
         )
     except Exception as exc:
         logger.error("整句词汇入库失败 (%s): %s", vocab["word"], exc)
@@ -489,6 +523,18 @@ async def _handle_sentence_add(query, telegram_id: str, data: str, context) -> N
 
     hint = "已加入词库！" if is_new else "已在词库中"
     await query.answer(f"✅ {vocab['word']} {hint}")
+
+    # 新词入库后，检查是否触发动态等级调整
+    if is_new:
+        new_count = count_vocab(telegram_id, target_language=target_language)
+        settings_fresh = get_user_settings(telegram_id)
+        current_proficiency = settings_fresh.get("proficiency_level", 0) or 0
+        if current_proficiency > 0:
+            from bot.handlers.messages import _check_dynamic_level_adjust
+            await _check_dynamic_level_adjust(
+                telegram_id, new_count, current_proficiency, native_language,
+                query.message.reply_text,
+            )
 
     added_key = f"{msg_id}_added"
     added: set[int] = context.chat_data.get(added_key, set())
@@ -545,7 +591,9 @@ async def _push_next_quiz(
             force_vocab=force_vocab,
         )
         if next_question:
-            await _send_quiz(query.message.reply_text, next_question, lang=lang)
+            sent = await _send_quiz(query.message.reply_text, next_question, lang=lang, context=context)
+            if sent is not None and context is not None:
+                context.user_data["last_quiz_msg_id"] = sent.message_id
         else:
             if context is not None:
                 context.user_data.pop("active_session", None)
@@ -670,75 +718,21 @@ async def _handle_vocab_info(query, data: str, context=None) -> None:
             raise
 
 
-# ── 词汇编辑：进入字段编辑 ────────────────────────────────────────────────────
+# ── 词汇讲词功能 ──────────────────────────────────────────────────────────────
 
-async def _handle_vocab_edit(query, telegram_id: str, data: str, context) -> None:
+async def _handle_explain_word(query, telegram_id: str, data: str, context=None) -> None:
     """
-    callback_data 格式: vedit:{record_id}:{field}:{page}
-    field = pos / definition / context
-    将消息替换为「请发送新 xxx：」提示，并在 user_data 中记录 pending_edit
-    """
-    parts = data.split(":", 3)
-    if len(parts) != 4:
-        await query.answer("解析错误", show_alert=False)
-        return
-
-    _, record_id, field, page_str = parts
-    try:
-        page = int(page_str)
-    except ValueError:
-        page = 0
-
-    lang = context.user_data.get("native_language", "zh")
-
-    # 字段名 i18n key 映射
-    field_key = {"pos": "edit_field_pos", "definition": "edit_field_def", "context": "edit_field_ctx"}.get(field)
-    if not field_key:
-        await query.answer(await t_async("edit_unknown_field", lang), show_alert=False)
-        return
-
-    record = get_vocab_detail(record_id)
-    if not record:
-        await query.answer("词汇记录不存在，可能已被删除。", show_alert=True)
-        return
-
-    word = record.get("word", "")
-    current_val = record.get(field, "") or "（无）"
-    field_name = await t_async(field_key, lang)
-
-    context.user_data["pending_edit"] = {
-        "record_id": record_id,
-        "field": field,
-        "word": word,
-        "page": page,
-    }
-
-    text = await t_async("edit_prompt", lang, word=word, field=field_name, current=current_val)
-    keyboard = await edit_field_keyboard(record_id, field, page, lang=lang)
-
-    await query.answer()
-    try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
-
-
-# ── 词汇编辑：多义词选择 ──────────────────────────────────────────────────────
-
-async def _handle_vocab_edit_select(query, data: str, context=None) -> None:
-    """
-    callback_data 格式: vedit_sel:{record_id}:{page}
-    用户从多义词列表中选择了一条，展示该条的详情 + 编辑按钮
+    callback_data 格式: explain:{record_id}:{page}
+    调用 AI 对词汇进行深度讲解，展示教学内容。
     """
     parts = data.split(":", 2)
     if len(parts) != 3:
         await query.answer("解析错误", show_alert=False)
         return
 
-    _, record_id, page_str = parts
+    record_id = parts[1]
     try:
-        page = int(page_str)
+        page = int(parts[2])
     except ValueError:
         page = 0
 
@@ -747,60 +741,48 @@ async def _handle_vocab_edit_select(query, data: str, context=None) -> None:
         await query.answer("词汇记录不存在，可能已被删除。", show_alert=True)
         return
 
-    lang = record.get("native_language", "zh")
+    # 读取用户母语
+    native_language = record.get("native_language", "zh")
     if context is not None:
-        lang = context.user_data.get("native_language", lang)
-
-    from bot.handlers.commands import _format_vocab_detail
-    text = await _format_vocab_detail(record, lang=lang)
-    keyboard = await vocab_detail_keyboard(record_id, page, lang=lang)
+        native_language = context.user_data.get("native_language", native_language)
 
     await query.answer()
+
+    # 展示加载提示
+    loading_text = "⏳ AI 讲词中，请稍候…"
     try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await query.edit_message_text(loading_text)
+    except Exception:
+        pass
+
+    try:
+        explanation = await explain_word_for_teaching(record, native_language=native_language)
+    except Exception as exc:
+        logger.error("AI 讲词失败 (record_id=%s): %s", record_id, exc)
+        explanation = "讲词服务暂时不可用，请稍后再试。"
+
+    # 构建返回按钮（返回词汇详情页）
+    word = record.get("word", "")
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    back_btn = InlineKeyboardButton("← 返回", callback_data=f"vinfo:{record_id}:{page}")
+    keyboard = InlineKeyboardMarkup([[back_btn]])
+
+    # 讲词内容可能较长（>4096 chars），超长时发新消息
+    max_len = 4000
+    if len(explanation) > max_len:
+        explanation = explanation[:max_len] + "\n\n…（内容已截断）"
+
+    try:
+        await query.edit_message_text(explanation, parse_mode="Markdown", reply_markup=keyboard)
     except BadRequest as e:
         if "not modified" not in str(e).lower():
-            raise
-
-
-# ── 词汇编辑：取消 ────────────────────────────────────────────────────────────
-
-async def _handle_vocab_edit_cancel(query, telegram_id: str, data: str, context) -> None:
-    """
-    callback_data 格式: vedit_cancel:{page}
-    清除 pending_edit，返回词库列表（原页码）
-    """
-    context.user_data.pop("pending_edit", None)
-
-    parts = data.split(":", 1)
-    try:
-        page = int(parts[1])
-    except (IndexError, ValueError):
-        page = 0
-
-    active_language = context.user_data.get("vocab_language", "en")
-    lang = context.user_data.get("native_language", "zh")
-
-    total = count_vocab(telegram_id, target_language=active_language, native_language=lang)
-    total_pages = math.ceil(total / PAGE_SIZE) if total > 0 else 1
-    page = max(0, min(page, total_pages - 1))
-    records = get_vocab_list(
-        telegram_id, page=page, page_size=PAGE_SIZE,
-        target_language=active_language, native_language=lang,
-    )
-    lang_display = get_language_display(active_language)
-
-    title = await t_async("vocab_title", lang, lang_name=lang_display, page=page + 1, total_pages=total_pages, total=total)
-    hint = await t_async("vocab_click_hint", lang)
-    text = f"{title}\n{hint}"
-    keyboard = await vocab_page_keyboard(page, total_pages, records, lang=lang)
-
-    await query.answer()
-    try:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
+            # Markdown 解析失败（可能含特殊字符），降级为纯文本
+            try:
+                await query.edit_message_text(explanation, reply_markup=keyboard)
+            except Exception:
+                await query.message.reply_text(explanation, reply_markup=keyboard)
+    except Exception:
+        await query.message.reply_text(explanation, reply_markup=keyboard)
 
 
 # ── 时区选择回调 ──────────────────────────────────────────────────────────────
@@ -827,10 +809,35 @@ async def _handle_timezone_select(query, telegram_id: str, data: str, context=No
     toast = await t_async("timezone_saved_toast", lang, tz=tz_value)
     await query.answer(toast, show_alert=False)
     try:
-        # 若处于 onboarding 流程，显示"设置完成"消息而非普通时区保存消息
+        # 若处于 onboarding 流程，时区完成后接入词汇水平评估
         if context and context.user_data.pop("onboarding_tz", False):
-            done_msg = await t_async("onboard_done", lang)
-            await query.edit_message_text(done_msg, parse_mode="Markdown")
+            settings = get_user_settings(telegram_id)
+            active_lang = settings.get("active_language", "en")
+
+            if active_lang == "en":
+                # 英语：启动 5 组锚点词 toggle 评估
+                from core.assessment import ASSESSMENT_BATCHES
+                context.user_data["assessment"] = {
+                    "batch": 1,
+                    "selections": {},
+                    "target_lang": active_lang,
+                    "lang": lang,
+                }
+                words = ASSESSMENT_BATCHES[1]
+                msg = (
+                    "📊 *词汇水平测评* — 第 1 组 / 共 5 组\n\n"
+                    "点击你 *确定认识* 的单词（可多选）："
+                )
+                keyboard = assessment_keyboard(1, words, set(), is_last_batch=False)
+                await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+            else:
+                # 非英语：显示自选水平键盘
+                msg = (
+                    "📊 *词汇水平设置*\n\n"
+                    "请选择你在该语言的词汇水平："
+                )
+                keyboard = level_select_keyboard()
+                await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         else:
             saved_msg = await t_async("timezone_saved", lang, tz=tz_value)
             await query.edit_message_text(saved_msg, parse_mode="Markdown")
@@ -1204,6 +1211,12 @@ async def _handle_vocab_confirm(query, telegram_id: str, data: str, context) -> 
                 context=vocab["context"],
                 target_language=target_language,
                 native_language=native_language,
+                word_level=vocab.get("word_level"),
+                quiz_synonyms=vocab.get("quiz_synonyms"),
+                antonyms=vocab.get("antonyms"),
+                word_family=vocab.get("word_family"),
+                etymology=vocab.get("etymology"),
+                collocations=vocab.get("collocations"),
             )
         except Exception as exc:
             logger.error("vc:add 入库失败 (%s): %s", vocab["word"], exc)
@@ -1212,6 +1225,18 @@ async def _handle_vocab_confirm(query, telegram_id: str, data: str, context) -> 
 
         hint = "已加入词库！" if is_new else "已在词库中"
         await query.answer(f"✅ {vocab['word']} {hint}")
+
+        # 新词入库后，检查是否触发动态等级调整
+        if is_new:
+            new_count = count_vocab(tid, target_language=target_language)
+            settings_fresh = get_user_settings(tid)
+            current_proficiency = settings_fresh.get("proficiency_level", 0) or 0
+            if current_proficiency > 0:
+                from bot.handlers.messages import _check_dynamic_level_adjust
+                await _check_dynamic_level_adjust(
+                    tid, new_count, current_proficiency, lang,
+                    query.message.reply_text,
+                )
 
         # 将已入库的按钮替换为 ✅ 已添加，不可再点
         class _V:
@@ -1242,7 +1267,9 @@ async def _handle_vocab_confirm(query, telegram_id: str, data: str, context) -> 
             else:
                 label = f"{add_label}  {v.word}{pos_part}"
                 rows.append([InlineKeyboardButton(label, callback_data=f"vc:add:{msg_id_str}:{i}")])
-        rows.append([InlineKeyboardButton(skip_label, callback_data=f"vc:skip:{msg_id_str}")])
+        # 只有还存在未添加的词时才显示跳过按钮
+        if len(added) < len(vocab_objs):
+            rows.append([InlineKeyboardButton(skip_label, callback_data=f"vc:skip:{msg_id_str}")])
         keyboard = InlineKeyboardMarkup(rows)
 
         try:
@@ -1274,3 +1301,350 @@ async def _handle_onboard_lang(query, telegram_id: str, data: str, context) -> N
         await query.edit_message_text(tz_prompt, reply_markup=timezone_keyboard())
     except Exception:
         pass
+
+
+# ── 词汇水平评估回调 ───────────────────────────────────────────────────────────
+
+async def _handle_assess_toggle(query, telegram_id: str, data: str, context) -> None:
+    """
+    callback_data 格式: assess_toggle:{batch_idx}:{word_idx}
+    切换词汇的选中/未选状态，刷新消息中的键盘。
+    """
+    parts = data.split(":")
+    if len(parts) != 3:
+        await query.answer()
+        return
+    try:
+        batch_idx = int(parts[1])
+        word_idx = int(parts[2])
+    except ValueError:
+        await query.answer()
+        return
+
+    await query.answer()
+
+    assessment = context.user_data.get("assessment", {})
+    selections = assessment.get("selections", {})
+    batch_selections: set = set(selections.get(batch_idx, set()))
+
+    # toggle
+    if word_idx in batch_selections:
+        batch_selections.discard(word_idx)
+    else:
+        batch_selections.add(word_idx)
+    selections[batch_idx] = batch_selections
+    assessment["selections"] = selections
+    context.user_data["assessment"] = assessment
+
+    from core.assessment import ASSESSMENT_BATCHES
+    words = ASSESSMENT_BATCHES.get(batch_idx, [])
+    is_last = (batch_idx == 5)
+
+    # 只更新键盘，不重传消息文本，速度快约 3-5 倍，避免快速点击时请求冲突
+    keyboard = assessment_keyboard(batch_idx, words, batch_selections, is_last_batch=is_last)
+    try:
+        await query.edit_message_reply_markup(reply_markup=keyboard)
+    except Exception:
+        pass
+
+
+async def _handle_assess_next(query, telegram_id: str, data: str, context) -> None:
+    """
+    callback_data 格式: assess_next:{batch_idx}
+    从当前组前往下一组（batch_idx + 1）。
+    """
+    parts = data.split(":")
+    if len(parts) != 2:
+        await query.answer()
+        return
+    try:
+        batch_idx = int(parts[1])
+    except ValueError:
+        await query.answer()
+        return
+
+    await query.answer()
+
+    next_batch = batch_idx + 1
+    if next_batch > 5:
+        # 不应发生，直接触发完成
+        await _handle_assess_done(query, telegram_id, context)
+        return
+
+    # 确保当前组 selections 初始化
+    assessment = context.user_data.get("assessment", {})
+    if "selections" not in assessment:
+        assessment["selections"] = {}
+    assessment["batch"] = next_batch
+    context.user_data["assessment"] = assessment
+
+    from core.assessment import ASSESSMENT_BATCHES
+    words = ASSESSMENT_BATCHES.get(next_batch, [])
+    is_last = (next_batch == 5)
+    current_selections = set(assessment["selections"].get(next_batch, set()))
+
+    msg = (
+        f"📊 *词汇水平测评* — 第 {next_batch} 组 / 共 5 组\n\n"
+        f"点击你 *确定认识* 的单词（可多选）："
+    )
+    keyboard = assessment_keyboard(next_batch, words, current_selections, is_last_batch=is_last)
+    try:
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception:
+        pass
+
+
+async def _handle_assess_done(query, telegram_id: str, context) -> None:
+    """
+    callback_data: assess_done
+    计算评估结果，写入 DB，显示结果消息。
+    """
+    await query.answer()
+
+    from core.assessment import score_assessment, get_level_name, ASSESSMENT_BATCHES
+    assessment = context.user_data.pop("assessment", {})
+    selections = assessment.get("selections", {})
+
+    level = score_assessment(selections)
+    lang = assessment.get("lang", "zh")
+
+    try:
+        set_proficiency_level(telegram_id, level, mark_done=True)
+    except Exception as exc:
+        logger.error("保存词汇水平失败: %s", exc)
+
+    level_name = get_level_name(level, lang)
+
+    # 构建反馈消息
+    level_hints = {
+        1: "之后分析句子时我会推荐初学词汇。",
+        2: "之后分析句子时我会推荐高中/四级水平词汇。",
+        3: "之后分析句子时我会推荐六级/雅思6水平词汇。",
+        4: "之后分析句子时我会推荐托福/雅思7+水平词汇。",
+        5: "之后分析句子时我会推荐GRE/学术写作水平词汇。",
+    }
+    hint = level_hints.get(level, "")
+
+    msg = (
+        f"🎯 *评估完成！*\n\n"
+        f"你的词汇水平大约是 *Level {level}（{level_name}）*\n\n"
+        f"{hint}\n\n"
+        f"你也可以随时用 /level 调整词汇等级。"
+    )
+    try:
+        await query.edit_message_text(msg, parse_mode="Markdown")
+    except Exception:
+        pass
+
+
+# ── /level 手动设置词汇水平 ───────────────────────────────────────────────────
+
+async def _handle_level_set(query, telegram_id: str, data: str, context) -> None:
+    """
+    callback_data 格式: level_set:{level}（1-5）
+    手动设置用户词汇水平，静默写入 DB 后刷新键盘。
+    """
+    parts = data.split(":")
+    if len(parts) != 2:
+        await query.answer()
+        return
+    try:
+        level = int(parts[1])
+        level = max(1, min(5, level))
+    except ValueError:
+        await query.answer()
+        return
+
+    try:
+        set_proficiency_level(telegram_id, level, mark_done=True)
+    except Exception as exc:
+        logger.error("手动设置词汇水平失败: %s", exc)
+
+    from core.assessment import get_level_name
+    settings = get_user_settings(telegram_id)
+    lang = settings.get("native_language", "zh")
+    level_name = get_level_name(level, lang)
+
+    await query.answer(f"✅ 词汇等级已设为 Level {level}", show_alert=False)
+
+    # 判断是来自 onboarding 还是 /level 命令（看消息内容区分）
+    msg_text = query.message.text or ""
+    if "测评" in msg_text or "词汇水平设置" in msg_text and "level_set" not in msg_text:
+        # onboarding 自选流程：显示完成消息
+        msg = (
+            f"🎯 *设置完成！*\n\n"
+            f"你的词汇水平已设为 *Level {level}（{level_name}）*\n\n"
+            f"你也可以随时用 /level 调整词汇等级。"
+        )
+        try:
+            await query.edit_message_text(msg, parse_mode="Markdown")
+        except Exception:
+            pass
+    else:
+        # /level 命令：刷新键盘
+        text = (
+            f"📊 *词汇水平设置*\n\n"
+            f"当前等级：**Level {level}** — {level_name}\n\n"
+            f"选择你的词汇水平："
+        )
+        keyboard = proficiency_keyboard(level)
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception:
+            pass
+
+
+# ── 同义词辨析题回调 ──────────────────────────────────────────────────────────
+
+async def _handle_synonym_answer(
+    query, telegram_id: str, data: str, practice_mode: bool = False, context=None
+) -> None:
+    """
+    callback_data 格式: qs:{record_id}:{choice_idx|skip}
+    用户选择同义词选项，判断是否正确并更新 SM-2。
+    """
+    # 防止 Telegram 重试导致的重复处理（网络断线重传场景）
+    if context is not None:
+        answered_msgs: set = context.user_data.setdefault("answered_msgs", set())
+        _msg_id = query.message.message_id
+        if _msg_id in answered_msgs:
+            await query.answer()
+            return
+        answered_msgs.add(_msg_id)
+
+    # 用户已回答，清除调度器推送记录，允许下次继续推送
+    try:
+        from scheduler.reminder import _pending_quiz
+        _pending_quiz.pop(telegram_id, None)
+    except Exception:
+        pass
+
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return
+    _, record_id, choice = parts
+
+    row = get_vocab_detail(record_id)
+    if not row:
+        await query.edit_message_text(await t_async("vocab_record_not_found", "zh"))
+        return
+
+    correct_word = row["word"]
+    current_level = row["level"]
+    definition = row["definition"]
+    current_ef = row.get("ease_factor") or 2.5
+    target_language = row.get("target_language", "en")
+    native_language = row.get("native_language", "zh")
+    lang = native_language
+
+    # 取正确同义词（quiz_synonyms[0]）
+    quiz_synonyms = row.get("quiz_synonyms") or []
+    correct_synonym = quiz_synonyms[0] if quiz_synonyms else ""
+
+    if choice == "skip":
+        if not practice_mode:
+            new_level, new_ef, next_review_dt = next_level_and_review(current_level, current_ef, "fuzzy")
+            next_review_iso = format_next_review(next_review_dt)
+            try:
+                update_vocab_after_review(record_id, new_level, next_review_iso, ease_factor=new_ef)
+            except Exception as exc:
+                logger.error("更新跳过记录失败: %s", exc)
+        skip_append = await t_async("quiz_skip_append", lang)
+        await query.edit_message_text(
+            query.message.text + skip_append,
+            parse_mode="Markdown",
+        )
+        await _push_next_quiz(query, telegram_id, practice_mode=practice_mode, context=context, lang=lang)
+        return
+
+    # 从按钮文本恢复选项
+    options = [
+        btn.text
+        for row_kb in query.message.reply_markup.inline_keyboard[:2]
+        for btn in row_kb
+    ]
+    try:
+        chosen_index = int(choice)
+        chosen_word = options[chosen_index]
+    except (ValueError, IndexError):
+        return
+
+    correct = correct_synonym and (chosen_word.strip() == correct_synonym.strip())
+
+    if practice_mode:
+        feedback = (
+            f"✅ *正确！*\n\n*{correct_word}* — {definition}\n同义词：{correct_synonym}"
+            if correct else
+            f"❌ *不对*\n\n*{correct_word}* — {definition}\n正确同义词：*{correct_synonym}*"
+        )
+    else:
+        result = "correct" if correct else "wrong"
+        new_level, new_ef, next_review_dt = next_level_and_review(current_level, current_ef, result)
+        next_review_iso = format_next_review(next_review_dt)
+        try:
+            update_vocab_after_review(record_id, new_level, next_review_iso, ease_factor=new_ef)
+        except Exception as exc:
+            logger.error("更新同义词题记录失败: %s", exc)
+
+        if correct:
+            level_text = await t_async(f"level_{new_level}", lang)
+            feedback = (
+                f"✅ *正确！*\n\n*{correct_word}* — {definition}\n"
+                f"同义词：{correct_synonym}\n\n"
+                f"📈 {level_text} → 🗓 {next_review_dt.strftime('%m/%d')}"
+            )
+        else:
+            level_text = await t_async(f"level_{new_level}", lang)
+            feedback = (
+                f"❌ *答错了*\n\n*{correct_word}* — {definition}\n"
+                f"正确同义词：*{correct_synonym}*\n\n"
+                f"📉 {level_text}"
+            )
+
+    try:
+        await query.edit_message_text(feedback, parse_mode="Markdown")
+    except Exception:
+        pass
+
+    await _push_next_quiz(query, telegram_id, practice_mode=practice_mode, context=context, lang=lang)
+
+
+# ── 造句题跳过回调 ─────────────────────────────────────────────────────────────
+
+async def _handle_gen_skip(query, telegram_id: str, data: str, context) -> None:
+    """
+    callback_data 格式: gen_skip:{record_id}
+    跳过造句题，等同于 fuzzy，清除 pending_generation 状态。
+    """
+    parts = data.split(":", 1)
+    record_id = parts[1] if len(parts) == 2 else ""
+
+    # 清除 pending_generation 状态
+    pending = context.user_data.pop("pending_generation", None)
+    lang = "zh"
+    if pending:
+        lang = pending.get("native_language", "zh")
+        practice_mode = pending.get("practice_mode", False)
+        current_ef = pending.get("ease_factor", 2.5)
+        current_level = pending.get("current_level", 0)
+
+        if not practice_mode and record_id:
+            new_level, new_ef, next_review_dt = next_level_and_review(current_level, current_ef, "fuzzy")
+            next_review_iso = format_next_review(next_review_dt)
+            try:
+                update_vocab_after_review(record_id, new_level, next_review_iso, ease_factor=new_ef)
+            except Exception as exc:
+                logger.error("造句跳过更新失败: %s", exc)
+    else:
+        practice_mode = False
+
+    await query.answer()
+
+    word = pending.get("word", "") if pending else ""
+    skip_msg = f"⏭️ 已跳过「{word}」的造句练习" if word else "⏭️ 已跳过"
+    try:
+        await query.edit_message_text(skip_msg)
+    except Exception:
+        pass
+
+    await _push_next_quiz(query, telegram_id, practice_mode=practice_mode, context=context, lang=lang)

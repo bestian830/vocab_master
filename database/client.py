@@ -1,26 +1,185 @@
 """
-Supabase 客户端单例，供各模块复用
+数据库客户端：SQLAlchemy ORM + 本地 PostgreSQL
+对外函数签名与原 Supabase 版本完全兼容
 """
 import secrets
 import string
-from datetime import datetime, timezone, timedelta
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta, date
 
-from supabase import create_client, Client
-from config import SUPABASE_URL, SUPABASE_ANON_KEY, ADMIN_TELEGRAM_ID
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Text, DateTime, Float,
+    Boolean, Date, UniqueConstraint, func, distinct, text,
+)
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.dialects.postgresql import ARRAY, insert as pg_insert
 
-# 模块级单例
-_client: Client | None = None
+from config import DATABASE_URL, ADMIN_TELEGRAM_ID
+
+# ── ORM 基类 ──────────────────────────────────────────────────────────────────
+
+Base = declarative_base()
+
+# ── ORM 模型定义（取代 schema.sql）───────────────────────────────────────────
+
+class VocabRecord(Base):
+    __tablename__ = "vocab_records"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id     = Column(String, nullable=False, index=True)
+    word            = Column(String, nullable=False)
+    pos             = Column(String)
+    definition      = Column(Text, nullable=False)
+    context         = Column(Text)
+    target_language = Column(String, default="en", nullable=False)
+    native_language = Column(String, default="zh", nullable=False)
+    level           = Column(Integer, default=0, nullable=False)
+    next_review     = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    ease_factor     = Column(Float, default=2.5, nullable=False)
+    review_count    = Column(Integer, default=0, nullable=False)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+    # 富词汇元数据（AI 在解析时顺带生成，按需展示）
+    word_level    = Column(Integer, nullable=True)           # 1-5 难度级别
+    quiz_synonyms = Column(ARRAY(String), nullable=True)    # 同义词列表（index 0=正确同义词，1-3=错误近义词）
+    antonyms      = Column(ARRAY(String), nullable=True)    # 反义词
+    word_family   = Column(ARRAY(String), nullable=True)    # 词族（如 decide→decisive,decision）
+    etymology     = Column(String, nullable=True)            # 词根/前后缀简述
+    collocations  = Column(ARRAY(String), nullable=True)    # 常见固定搭配（目标语言）
+
+    __table_args__ = (
+        UniqueConstraint(
+            "telegram_id", "word", "definition", "target_language",
+            name="unique_vocab",
+        ),
+    )
 
 
-def get_client() -> Client:
-    """返回全局 Supabase 客户端"""
-    global _client
-    if _client is None:
-        _client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-    return _client
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+
+    telegram_id = Column(String, primary_key=True)
+    expires_at  = Column(DateTime(timezone=True), nullable=False)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
 
 
-# ── 词汇记录 CRUD ────────────────────────────────────────────────────────────
+class ActivationCode(Base):
+    __tablename__ = "activation_codes"
+
+    code          = Column(String, primary_key=True)
+    duration_days = Column(Integer, nullable=False)
+    used_by       = Column(String)
+    used_at       = Column(DateTime(timezone=True))
+    created_at    = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    telegram_id        = Column(String, primary_key=True)
+    timezone           = Column(String, default="UTC", nullable=False)
+    remind_start       = Column(Integer, default=8, nullable=False)
+    remind_end         = Column(Integer, default=22, nullable=False)
+    remind_enabled     = Column(Boolean, default=True, nullable=False)
+    streak_days        = Column(Integer, default=0, nullable=False)
+    last_active_date   = Column(Date)
+    native_language    = Column(String, default="zh", nullable=False)
+    active_language    = Column(String, default="en", nullable=False)
+    learning_languages = Column(ARRAY(String), default=["en"], nullable=False)
+    updated_at         = Column(DateTime(timezone=True), server_default=func.now())
+    # 词汇水平评估相关
+    proficiency_level  = Column(Integer, default=0, nullable=False)   # 0=未评估, 1-5 词汇水平
+    assessment_done    = Column(Boolean, default=False, nullable=False)  # 是否完成了 onboarding 评估
+
+
+# ── Engine 单例 + Session 工厂 ────────────────────────────────────────────────
+
+_engine = None
+_SessionFactory = None
+
+
+def _get_engine():
+    global _engine
+    if _engine is None:
+        _engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    return _engine
+
+
+def _get_session_factory():
+    global _SessionFactory
+    if _SessionFactory is None:
+        _SessionFactory = sessionmaker(
+            bind=_get_engine(), autocommit=False, autoflush=False
+        )
+    return _SessionFactory
+
+
+@contextmanager
+def _session():
+    """返回 Session context manager，自动 commit / rollback / close"""
+    session = _get_session_factory()()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def init_db() -> None:
+    """启动时调用，自动建表（表已存在则跳过）+ 兜底 ALTER TABLE 补充新列"""
+    Base.metadata.create_all(bind=_get_engine())
+    # 对已存在的表执行 ALTER TABLE，补充新列（IF NOT EXISTS 保证幂等性）
+    with _session() as session:
+        session.execute(text("""
+            ALTER TABLE vocab_records
+              ADD COLUMN IF NOT EXISTS word_level    INTEGER,
+              ADD COLUMN IF NOT EXISTS quiz_synonyms TEXT[],
+              ADD COLUMN IF NOT EXISTS antonyms      TEXT[],
+              ADD COLUMN IF NOT EXISTS word_family   TEXT[],
+              ADD COLUMN IF NOT EXISTS etymology     TEXT,
+              ADD COLUMN IF NOT EXISTS collocations  TEXT[]
+        """))
+        session.execute(text("""
+            ALTER TABLE user_settings
+              ADD COLUMN IF NOT EXISTS proficiency_level INTEGER NOT NULL DEFAULT 0,
+              ADD COLUMN IF NOT EXISTS assessment_done   BOOLEAN NOT NULL DEFAULT FALSE
+        """))
+
+
+# ── 工具函数 ──────────────────────────────────────────────────────────────────
+
+def _row_to_dict(row) -> dict:
+    """将 ORM 行对象转为 dict，兼容原 Supabase 返回格式（datetime → isoformat）"""
+    d = {}
+    for c in row.__table__.columns:
+        v = getattr(row, c.name)
+        # datetime 必须在 date 之前判断（datetime 是 date 的子类）
+        if isinstance(v, datetime):
+            d[c.name] = v.isoformat()
+        elif isinstance(v, date):
+            d[c.name] = v.isoformat()
+        else:
+            d[c.name] = v
+    return d
+
+
+def _convert_row_dict(d: dict) -> dict:
+    """将 _asdict() 结果中的 datetime/date 值统一转为 isoformat 字符串"""
+    result = {}
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            result[k] = v.isoformat()
+        elif isinstance(v, date):
+            result[k] = v.isoformat()
+        else:
+            result[k] = v
+    return result
+
+
+# ── 词汇记录 CRUD ─────────────────────────────────────────────────────────────
 
 def upsert_vocab(
     telegram_id: str,
@@ -30,46 +189,56 @@ def upsert_vocab(
     context: str | None,
     target_language: str = "en",
     native_language: str = "zh",
+    word_level: int | None = None,
+    quiz_synonyms: list[str] | None = None,
+    antonyms: list[str] | None = None,
+    word_family: list[str] | None = None,
+    etymology: str | None = None,
+    collocations: list[str] | None = None,
 ) -> tuple[dict, bool]:
     """
     插入新词汇；若 (telegram_id, word, definition, target_language) 已存在则跳过。
     返回 (记录 dict, is_new: bool)。
+    支持富词汇元数据字段（word_level, quiz_synonyms, antonyms, word_family, etymology, collocations）。
     """
-    db = get_client()
-    result = (
-        db.table("vocab_records")
-        .upsert(
-            {
-                "telegram_id": telegram_id,
-                "word": word,
-                "pos": pos,
-                "definition": definition,
-                "context": context,
-                "target_language": target_language,
-                "native_language": native_language,
-            },
-            on_conflict="telegram_id,word,definition,target_language",
-            # 已存在时不覆盖任何字段（不重置复习进度）
-            ignore_duplicates=True,
-        )
-        .execute()
+    # 构建插入值 dict，只在有值时才包含新字段
+    values = dict(
+        telegram_id=telegram_id,
+        word=word,
+        pos=pos,
+        definition=definition,
+        context=context,
+        target_language=target_language,
+        native_language=native_language,
     )
-    # 新增时 result.data 非空；冲突跳过时为空列表
-    is_new = bool(result.data)
+    if word_level is not None:
+        values["word_level"] = word_level
+    if quiz_synonyms is not None:
+        values["quiz_synonyms"] = quiz_synonyms
+    if antonyms is not None:
+        values["antonyms"] = antonyms
+    if word_family is not None:
+        values["word_family"] = word_family
+    if etymology is not None:
+        values["etymology"] = etymology
+    if collocations is not None:
+        values["collocations"] = collocations
 
-    # 取回实际记录（upsert ignore 时 data 为空列表）
-    rows = (
-        db.table("vocab_records")
-        .select("*")
-        .eq("telegram_id", telegram_id)
-        .eq("word", word)
-        .eq("definition", definition)
-        .eq("target_language", target_language)
-        .limit(1)
-        .execute()
-        .data
-    )
-    return rows[0] if rows else {}, is_new
+    with _session() as session:
+        stmt = pg_insert(VocabRecord).values(**values)
+        stmt = stmt.on_conflict_do_nothing(constraint="unique_vocab")
+        result = session.execute(stmt)
+        # rowcount=1 表示成功插入新行，=0 表示冲突跳过
+        is_new = result.rowcount == 1
+
+        # 取回实际记录（含自增 id 等字段）
+        row = session.query(VocabRecord).filter_by(
+            telegram_id=telegram_id,
+            word=word,
+            definition=definition,
+            target_language=target_language,
+        ).first()
+        return (_row_to_dict(row) if row else {}), is_new
 
 
 def get_due_vocab(
@@ -78,44 +247,31 @@ def get_due_vocab(
     native_language: str | None = None,
 ) -> list[dict]:
     """查询该用户指定语言所有到期（next_review <= now）的词汇"""
-    db = get_client()
-    query = (
-        db.table("vocab_records")
-        .select("*")
-        .eq("telegram_id", telegram_id)
-        .eq("target_language", target_language)
-        .lte("next_review", "now()")
-    )
-    if native_language:
-        query = query.eq("native_language", native_language)
-    return query.order("next_review").execute().data
+    with _session() as session:
+        query = session.query(VocabRecord).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.target_language == target_language,
+            VocabRecord.next_review <= datetime.now(timezone.utc),
+        )
+        if native_language:
+            query = query.filter(VocabRecord.native_language == native_language)
+        rows = query.order_by(VocabRecord.next_review).all()
+        return [_row_to_dict(r) for r in rows]
 
 
 def get_all_due_users() -> list[dict]:
     """
     查询所有有到期词汇的用户，按 (telegram_id, target_language) 去重。
     返回 [{"telegram_id": ..., "target_language": ...}, ...]
-    每个用户可因多语言而出现多条。
     """
-    db = get_client()
-    rows = (
-        db.table("vocab_records")
-        .select("telegram_id,target_language")
-        .lte("next_review", "now()")
-        .execute()
-        .data
-    )
-    # Python 侧按 (telegram_id, target_language) 去重
-    seen: set[tuple] = set()
-    result: list[dict] = []
-    for row in rows:
-        tid = row["telegram_id"]
-        lang = row.get("target_language", "en")
-        key = (tid, lang)
-        if key not in seen:
-            seen.add(key)
-            result.append({"telegram_id": tid, "target_language": lang})
-    return result
+    with _session() as session:
+        pairs = (
+            session.query(VocabRecord.telegram_id, VocabRecord.target_language)
+            .filter(VocabRecord.next_review <= datetime.now(timezone.utc))
+            .distinct()
+            .all()
+        )
+        return [{"telegram_id": tid, "target_language": lang} for tid, lang in pairs]
 
 
 def get_vocab_list(
@@ -126,24 +282,30 @@ def get_vocab_list(
     native_language: str | None = None,
 ) -> list[dict]:
     """分页获取用户指定语言词库，按 level ASC, next_review ASC 排序"""
-    db = get_client()
-    offset = page * page_size
-    query = (
-        db.table("vocab_records")
-        .select("id,word,pos,definition,level,review_count,next_review")
-        .eq("telegram_id", telegram_id)
-        .eq("target_language", target_language)
-    )
-    if native_language:
-        query = query.eq("native_language", native_language)
-    return (
-        query
-        .order("level", desc=False)
-        .order("next_review", desc=False)
-        .range(offset, offset + page_size - 1)
-        .execute()
-        .data
-    )
+    with _session() as session:
+        query = session.query(
+            VocabRecord.id,
+            VocabRecord.word,
+            VocabRecord.pos,
+            VocabRecord.definition,
+            VocabRecord.level,
+            VocabRecord.review_count,
+            VocabRecord.next_review,
+        ).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.target_language == target_language,
+        )
+        if native_language:
+            query = query.filter(VocabRecord.native_language == native_language)
+        rows = (
+            query
+            .order_by(VocabRecord.level.asc(), VocabRecord.next_review.asc())
+            .offset(page * page_size)
+            .limit(page_size)
+            .all()
+        )
+        # 命名元组 → dict，并将 datetime 转为 isoformat 字符串
+        return [_convert_row_dict(r._asdict()) for r in rows]
 
 
 def count_vocab(
@@ -152,16 +314,14 @@ def count_vocab(
     native_language: str | None = None,
 ) -> int:
     """返回用户指定语言词库总数"""
-    db = get_client()
-    query = (
-        db.table("vocab_records")
-        .select("id", count="exact")
-        .eq("telegram_id", telegram_id)
-        .eq("target_language", target_language)
-    )
-    if native_language:
-        query = query.eq("native_language", native_language)
-    return query.execute().count or 0
+    with _session() as session:
+        query = session.query(func.count(VocabRecord.id)).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.target_language == target_language,
+        )
+        if native_language:
+            query = query.filter(VocabRecord.native_language == native_language)
+        return query.scalar() or 0
 
 
 def update_vocab_after_review(
@@ -172,61 +332,43 @@ def update_vocab_after_review(
     telegram_id: str | None = None,
 ) -> None:
     """复习后更新 level、next_review、ease_factor，并将 review_count +1；同步更新连续学习天数"""
-    db = get_client()
-    # 先取当前 review_count 和 telegram_id（若未传入则从记录中读取）
-    row = (
-        db.table("vocab_records")
-        .select("review_count,telegram_id")
-        .eq("id", record_id)
-        .single()
-        .execute()
-        .data
-    )
-    current_count = row["review_count"] if row else 0
-    update_dict: dict = {
-        "level": level,
-        "next_review": next_review_iso,
-        "review_count": current_count + 1,
-    }
-    # 若提供了新 ease_factor，一并更新
-    if ease_factor is not None:
-        update_dict["ease_factor"] = ease_factor
-    db.table("vocab_records").update(update_dict).eq("id", record_id).execute()
+    next_review_dt = datetime.fromisoformat(next_review_iso.replace("Z", "+00:00"))
+    tid = telegram_id
 
-    # 更新连续学习天数
-    tid = telegram_id or (row.get("telegram_id") if row else None)
+    with _session() as session:
+        row = session.query(VocabRecord).filter_by(id=int(record_id)).first()
+        if row:
+            row.level        = level
+            row.next_review  = next_review_dt
+            row.review_count = row.review_count + 1
+            if ease_factor is not None:
+                row.ease_factor = ease_factor
+            tid = tid or row.telegram_id
+
+    # 更新连续学习天数（使用独立 session）
     if tid:
         update_streak(tid)
 
 
-# ── 订阅系统 ─────────────────────────────────────────────────────────────────
+# ── 订阅系统 ──────────────────────────────────────────────────────────────────
 
 def get_subscription(telegram_id: str) -> datetime | None:
-    """返回订阅到期时间（aware datetime），无订阅或表不存在则返回 None"""
-    db = get_client()
+    """返回订阅到期时间（aware datetime），无订阅则返回 None"""
     try:
-        rows = (
-            db.table("subscriptions")
-            .select("expires_at")
-            .eq("telegram_id", telegram_id)
-            .limit(1)
-            .execute()
-            .data
-        )
+        with _session() as session:
+            row = session.query(Subscription).filter_by(
+                telegram_id=telegram_id
+            ).first()
+            if row is None:
+                return None
+            # DateTime(timezone=True) + psycopg2 返回 tz-aware datetime
+            return row.expires_at
     except Exception:
-        # 表不存在（PGRST205）或其他错误时静默降级，视为无订阅
         return None
-    if not rows:
-        return None
-    expires_str = rows[0]["expires_at"]
-    # Supabase 返回 ISO 8601 字符串，解析为 aware datetime
-    dt = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
-    return dt
 
 
 def is_pro(telegram_id: str) -> bool:
-    """判断用户是否处于有效订阅状态（expires_at > 当前 UTC 时间）；管理员默认返回 True"""
-    # 管理员账号默认享有 Pro 权限，不受订阅限制
+    """判断用户是否处于有效订阅状态；管理员默认返回 True"""
     if ADMIN_TELEGRAM_ID and telegram_id == ADMIN_TELEGRAM_ID:
         return True
     expires = get_subscription(telegram_id)
@@ -237,200 +379,174 @@ def is_pro(telegram_id: str) -> bool:
 
 def get_today_add_count(telegram_id: str) -> int:
     """统计该用户今天（UTC 日期）新增的词汇条数"""
-    db = get_client()
     today_start = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
-    ).isoformat()
-    result = (
-        db.table("vocab_records")
-        .select("id", count="exact")
-        .eq("telegram_id", telegram_id)
-        .gte("created_at", today_start)
-        .execute()
     )
-    return result.count or 0
+    with _session() as session:
+        return session.query(func.count(VocabRecord.id)).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.created_at >= today_start,
+        ).scalar() or 0
 
 
 def activate_code(telegram_id: str, code: str) -> tuple[bool, str]:
     """
     核销激活码，写入或延长用户订阅。
     返回 (success: bool, message: str)。
-    表不存在时返回友好错误信息而不是抛出异常。
     """
-    db = get_client()
-
-    # 查激活码（捕获表不存在的情况）
     try:
-        rows = (
-            db.table("activation_codes")
-            .select("*")
-            .eq("code", code)
-            .limit(1)
-            .execute()
-            .data
-        )
+        with _session() as session:
+            code_row = session.query(ActivationCode).filter_by(code=code).first()
+            if code_row is None:
+                return False, "激活码不存在，请检查是否输入正确。"
+            if code_row.used_by:
+                return False, "该激活码已被使用，无法重复激活。"
+
+            duration_days = code_row.duration_days
+            now = datetime.now(timezone.utc)
+
+            # 若已有有效订阅则续期，否则从现在起算
+            sub_row = session.query(Subscription).filter_by(
+                telegram_id=telegram_id
+            ).first()
+            existing = sub_row.expires_at if sub_row else None
+            base = existing if (existing and existing > now) else now
+            new_expires = base + timedelta(days=duration_days)
+
+            # 写入 / 更新订阅
+            if sub_row:
+                sub_row.expires_at = new_expires
+            else:
+                session.add(Subscription(telegram_id=telegram_id, expires_at=new_expires))
+
+            # 核销激活码
+            code_row.used_by = telegram_id
+            code_row.used_at = now
+
+            return True, new_expires.strftime("%Y-%m-%d")
     except Exception:
         return False, "激活码功能未初始化，请联系管理员。"
-    if not rows:
-        return False, "激活码不存在，请检查是否输入正确。"
-
-    row = rows[0]
-    if row.get("used_by"):
-        return False, "该激活码已被使用，无法重复激活。"
-
-    duration_days: int = row["duration_days"]
-    now = datetime.now(timezone.utc)
-
-    # 若已有订阅且未过期则续期，否则从现在起算
-    existing = get_subscription(telegram_id)
-    base = existing if (existing and existing > now) else now
-    new_expires = base + timedelta(days=duration_days)
-    new_expires_iso = new_expires.isoformat()
-
-    # 写入/更新 subscriptions
-    db.table("subscriptions").upsert(
-        {"telegram_id": telegram_id, "expires_at": new_expires_iso},
-        on_conflict="telegram_id",
-    ).execute()
-
-    # 核销激活码
-    db.table("activation_codes").update(
-        {"used_by": telegram_id, "used_at": now.isoformat()}
-    ).eq("code", code).execute()
-
-    return True, new_expires.strftime("%Y-%m-%d")
 
 
 def extend_subscription(telegram_id: str, days: int) -> str:
     """
     直接为指定用户延长订阅 days 天。
-    若已有未过期订阅则在其基础上续期，否则从当前时间起算。
     返回新的到期日字符串（YYYY-MM-DD）。
     """
-    db = get_client()
-    now = datetime.now(timezone.utc)
+    with _session() as session:
+        now = datetime.now(timezone.utc)
+        sub_row = session.query(Subscription).filter_by(
+            telegram_id=telegram_id
+        ).first()
+        existing = sub_row.expires_at if sub_row else None
+        base = existing if (existing and existing > now) else now
+        new_expires = base + timedelta(days=days)
 
-    # 若已有有效订阅则续期，否则从现在起算
-    existing = get_subscription(telegram_id)
-    base = existing if (existing and existing > now) else now
-    new_expires = base + timedelta(days=days)
+        if sub_row:
+            sub_row.expires_at = new_expires
+        else:
+            session.add(Subscription(telegram_id=telegram_id, expires_at=new_expires))
 
-    db.table("subscriptions").upsert(
-        {"telegram_id": telegram_id, "expires_at": new_expires.isoformat()},
-        on_conflict="telegram_id",
-    ).execute()
-
-    return new_expires.strftime("%Y-%m-%d")
+        return new_expires.strftime("%Y-%m-%d")
 
 
 def generate_codes(duration_days: int, count: int) -> list[str]:
     """
     生成 count 个随机激活码（8位大写字母+数字），写入 DB 并返回码列表。
-    表不存在时抛出 RuntimeError，由上层 handler 提示用户建表。
     """
     alphabet = string.ascii_uppercase + string.digits
-    db = get_client()
     codes: list[str] = []
-    for _ in range(count):
-        code = "".join(secrets.choice(alphabet) for _ in range(8))
-        try:
-            db.table("activation_codes").insert(
-                {"code": code, "duration_days": duration_days}
-            ).execute()
-        except Exception as exc:
-            raise RuntimeError("activation_codes 表不存在，请先在 Supabase 建表") from exc
-        codes.append(code)
+    try:
+        with _session() as session:
+            for _ in range(count):
+                code = "".join(secrets.choice(alphabet) for _ in range(8))
+                session.add(ActivationCode(code=code, duration_days=duration_days))
+                codes.append(code)
+    except Exception as exc:
+        raise RuntimeError("activation_codes 表不存在，请先建表") from exc
     return codes
 
 
 def delete_vocab_by_id(record_id: str) -> bool:
     """按主键删除单条词汇记录，返回是否删除成功"""
-    db = get_client()
-    result = (
-        db.table("vocab_records")
-        .delete()
-        .eq("id", record_id)
-        .execute()
-    )
-    return bool(result.data)
+    with _session() as session:
+        row = session.query(VocabRecord).filter_by(id=int(record_id)).first()
+        if row is None:
+            return False
+        session.delete(row)
+        return True
 
 
 def delete_vocab_by_word(
     telegram_id: str, word: str, target_language: str | None = None
 ) -> int:
-    """按用户 ID + 单词（大小写不敏感）删除全部匹配记录，返回删除条数。
-    target_language 不为 None 时限制在该语言词库内删除。"""
-    db = get_client()
-    query = (
-        db.table("vocab_records")
-        .delete()
-        .eq("telegram_id", telegram_id)
-        .ilike("word", word)
-    )
-    if target_language is not None:
-        query = query.eq("target_language", target_language)
-    result = query.execute()
-    return len(result.data) if result.data else 0
+    """按用户 ID + 单词（大小写不敏感）删除全部匹配记录，返回删除条数。"""
+    with _session() as session:
+        query = session.query(VocabRecord).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.word.ilike(word),
+        )
+        if target_language is not None:
+            query = query.filter(VocabRecord.target_language == target_language)
+        rows = query.all()
+        for row in rows:
+            session.delete(row)
+        return len(rows)
 
 
 def count_vocab_by_native(telegram_id: str, native_language: str) -> int:
     """返回指定用户特定母语下的全部词汇总数（跨所有 target_language）"""
-    db = get_client()
-    result = (
-        db.table("vocab_records")
-        .select("id", count="exact")
-        .eq("telegram_id", telegram_id)
-        .eq("native_language", native_language)
-        .execute()
-    )
-    return result.count or 0
+    with _session() as session:
+        return session.query(func.count(VocabRecord.id)).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.native_language == native_language,
+        ).scalar() or 0
 
 
 def delete_vocab_by_native_language(telegram_id: str, native_language: str) -> int:
     """删除指定用户特定母语下的全部词汇（跨所有 target_language），返回删除条数"""
-    db = get_client()
-    result = (
-        db.table("vocab_records")
-        .delete()
-        .eq("telegram_id", telegram_id)
-        .eq("native_language", native_language)
-        .execute()
-    )
-    return len(result.data) if result.data else 0
+    with _session() as session:
+        rows = session.query(VocabRecord).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.native_language == native_language,
+        ).all()
+        for row in rows:
+            session.delete(row)
+        return len(rows)
 
 
 def get_level_distribution(telegram_id: str) -> dict[int, int]:
-    """返回各级别词汇数量 {level: count}，缺少的级别不在结果中"""
-    db = get_client()
-    rows = (
-        db.table("vocab_records")
-        .select("level")
-        .eq("telegram_id", telegram_id)
-        .execute()
-        .data
-    )
-    dist: dict[int, int] = {}
-    for row in rows:
-        lvl = row["level"]
-        dist[lvl] = dist.get(lvl, 0) + 1
-    return dist
+    """返回各级别词汇数量 {level: count}"""
+    with _session() as session:
+        rows = session.query(
+            VocabRecord.level, func.count(VocabRecord.id)
+        ).filter(
+            VocabRecord.telegram_id == telegram_id
+        ).group_by(VocabRecord.level).all()
+        return {lvl: cnt for lvl, cnt in rows}
 
 
 def get_vocab_by_word(
     telegram_id: str, word: str, target_language: str | None = None
 ) -> list[dict]:
-    """按用户 ID + 单词（大小写不敏感）查询所有匹配记录，含例句和下次复习时间。
-    target_language 不为 None 时限制在该语言词库内查询。"""
-    db = get_client()
-    query = (
-        db.table("vocab_records")
-        .select("id,word,pos,definition,level,context,next_review")
-        .eq("telegram_id", telegram_id)
-        .ilike("word", word)
-    )
-    if target_language is not None:
-        query = query.eq("target_language", target_language)
-    return query.execute().data
+    """按用户 ID + 单词（大小写不敏感）查询所有匹配记录。"""
+    with _session() as session:
+        query = session.query(
+            VocabRecord.id,
+            VocabRecord.word,
+            VocabRecord.pos,
+            VocabRecord.definition,
+            VocabRecord.level,
+            VocabRecord.context,
+            VocabRecord.next_review,
+        ).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.word.ilike(word),
+        )
+        if target_language is not None:
+            query = query.filter(VocabRecord.target_language == target_language)
+        rows = query.all()
+        return [_convert_row_dict(r._asdict()) for r in rows]
 
 
 def get_practice_vocab(
@@ -440,16 +556,15 @@ def get_practice_vocab(
     native_language: str | None = None,
 ) -> list[dict]:
     """获取词库中随机词汇，不限 next_review，供练习模式使用"""
-    query = (
-        get_client()
-        .table("vocab_records")
-        .select("*")
-        .eq("telegram_id", telegram_id)
-        .eq("target_language", target_language)
-    )
-    if native_language:
-        query = query.eq("native_language", native_language)
-    return query.limit(limit).execute().data
+    with _session() as session:
+        query = session.query(VocabRecord).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.target_language == target_language,
+        )
+        if native_language:
+            query = query.filter(VocabRecord.native_language == native_language)
+        rows = query.limit(limit).all()
+        return [_row_to_dict(r) for r in rows]
 
 
 def get_random_words_for_distractor(
@@ -459,101 +574,58 @@ def get_random_words_for_distractor(
     target_language: str = "en",
     native_language: str | None = None,
 ) -> list[dict]:
-    """随机取 count 条同语言的不同词作为干扰项（干扰项与正确词同语言）"""
-    db = get_client()
-    query = (
-        db.table("vocab_records")
-        .select("id,word,definition")
-        .eq("telegram_id", telegram_id)
-        .eq("target_language", target_language)
-        .neq("id", exclude_id)
-    )
-    if native_language:
-        query = query.eq("native_language", native_language)
-    return query.limit(count * 3).execute().data  # 多取一些，Python 侧随机截取
+    """随机取 count 条同语言的不同词作为干扰项"""
+    with _session() as session:
+        query = session.query(
+            VocabRecord.id, VocabRecord.word, VocabRecord.definition
+        ).filter(
+            VocabRecord.telegram_id == telegram_id,
+            VocabRecord.target_language == target_language,
+            VocabRecord.id != int(exclude_id),
+        )
+        if native_language:
+            query = query.filter(VocabRecord.native_language == native_language)
+        rows = query.order_by(func.random()).limit(count * 3).all()
+        return [_convert_row_dict(r._asdict()) for r in rows]
 
 
 def get_all_vocab(telegram_id: str) -> list[dict]:
     """获取用户全部词汇（不分页），用于导出"""
-    db = get_client()
-    return (
-        db.table("vocab_records")
-        .select("word,pos,definition,context,level,next_review,created_at,target_language")
-        .eq("telegram_id", telegram_id)
-        .order("created_at", desc=True)
-        .execute()
-        .data
-    )
+    with _session() as session:
+        rows = session.query(
+            VocabRecord.word,
+            VocabRecord.pos,
+            VocabRecord.definition,
+            VocabRecord.context,
+            VocabRecord.level,
+            VocabRecord.next_review,
+            VocabRecord.created_at,
+            VocabRecord.target_language,
+        ).filter(
+            VocabRecord.telegram_id == telegram_id
+        ).order_by(VocabRecord.created_at.desc()).all()
+        return [_convert_row_dict(r._asdict()) for r in rows]
 
 
 def get_vocab_detail(record_id: str) -> dict | None:
-    """按主键取单条完整词汇记录，供详情弹窗使用"""
-    db = get_client()
-    rows = (
-        db.table("vocab_records")
-        .select("*")
-        .eq("id", record_id)
-        .limit(1)
-        .execute()
-        .data
-    )
-    return rows[0] if rows else None
+    """按主键取单条完整词汇记录"""
+    with _session() as session:
+        row = session.query(VocabRecord).filter_by(id=int(record_id)).first()
+        return _row_to_dict(row) if row else None
 
 
 def get_vocab_count_by_language(telegram_id: str) -> dict[str, int]:
     """返回各语言词汇数量 {lang_code: count}"""
-    db = get_client()
-    rows = (
-        db.table("vocab_records")
-        .select("target_language")
-        .eq("telegram_id", telegram_id)
-        .execute()
-        .data
-    )
-    result: dict[str, int] = {}
-    for row in rows:
-        lang = row.get("target_language", "en")
-        result[lang] = result.get(lang, 0) + 1
-    return result
+    with _session() as session:
+        rows = session.query(
+            VocabRecord.target_language, func.count(VocabRecord.id)
+        ).filter(
+            VocabRecord.telegram_id == telegram_id
+        ).group_by(VocabRecord.target_language).all()
+        return {lang: cnt for lang, cnt in rows}
 
 
 # ── 用户设置 ──────────────────────────────────────────────────────────────────
-
-def get_user_settings(telegram_id: str) -> dict:
-    """
-    获取用户设置，不存在或表不存在时返回默认值（静默处理）。
-    返回字段: timezone, remind_start, remind_end, remind_enabled,
-              native_language, active_language, learning_languages
-    """
-    db = get_client()
-    try:
-        rows = (
-            db.table("user_settings")
-            .select(
-                "timezone,remind_start,remind_end,remind_enabled,"
-                "native_language,active_language,learning_languages"
-            )
-            .eq("telegram_id", telegram_id)
-            .limit(1)
-            .execute()
-            .data
-        )
-    except Exception:
-        # 表不存在（PGRST205）或其他错误时静默降级
-        return _default_settings()
-    if rows:
-        row = rows[0]
-        # 新字段可能在旧数据库中不存在，补充默认值
-        row.setdefault("remind_enabled", True)
-        row.setdefault("native_language", "zh")
-        row.setdefault("active_language", "en")
-        row.setdefault("learning_languages", ["en"])
-        # learning_languages 可能返回 None（旧行），确保是列表
-        if not row.get("learning_languages"):
-            row["learning_languages"] = ["en"]
-        return row
-    return _default_settings()
-
 
 def _default_settings() -> dict:
     """返回用户设置的默认值"""
@@ -565,22 +637,48 @@ def _default_settings() -> dict:
         "native_language": "zh",
         "active_language": "en",
         "learning_languages": ["en"],
+        "proficiency_level": 0,
+        "assessment_done": False,
     }
+
+
+def get_user_settings(telegram_id: str) -> dict:
+    """
+    获取用户设置，不存在时返回默认值。
+    返回字段: timezone, remind_start, remind_end, remind_enabled,
+              native_language, active_language, learning_languages
+    """
+    try:
+        with _session() as session:
+            row = session.query(UserSettings).filter_by(
+                telegram_id=telegram_id
+            ).first()
+            if row is None:
+                return _default_settings()
+            result = {
+                "timezone":           row.timezone,
+                "remind_start":       row.remind_start,
+                "remind_end":         row.remind_end,
+                "remind_enabled":     row.remind_enabled,
+                "native_language":    row.native_language,
+                "active_language":    row.active_language,
+                "learning_languages": row.learning_languages or ["en"],
+                "proficiency_level":  getattr(row, "proficiency_level", 0) or 0,
+                "assessment_done":    getattr(row, "assessment_done", False) or False,
+            }
+            return result
+    except Exception:
+        return _default_settings()
 
 
 def has_user_settings(telegram_id: str) -> bool:
     """判断用户是否已有 user_settings 记录（用于新用户检测）"""
-    db = get_client()
     try:
-        rows = (
-            db.table("user_settings")
-            .select("telegram_id")
-            .eq("telegram_id", telegram_id)
-            .limit(1)
-            .execute()
-            .data
-        )
-        return bool(rows)
+        with _session() as session:
+            row = session.query(UserSettings.telegram_id).filter_by(
+                telegram_id=telegram_id
+            ).first()
+            return row is not None
     except Exception:
         return False
 
@@ -591,77 +689,78 @@ def set_user_languages(
     active_language: str | None = None,
 ) -> None:
     """upsert 用户语言设置（native_language 和/或 active_language）"""
-    db = get_client()
-    payload: dict = {"telegram_id": telegram_id}
-    if native_language is not None:
-        payload["native_language"] = native_language
-    if active_language is not None:
-        payload["active_language"] = active_language
-    try:
-        db.table("user_settings").upsert(
-            payload, on_conflict="telegram_id"
-        ).execute()
-    except Exception as exc:
-        raise RuntimeError("user_settings 表不存在") from exc
+    with _session() as session:
+        row = session.query(UserSettings).filter_by(
+            telegram_id=telegram_id
+        ).first()
+        if row:
+            if native_language is not None:
+                row.native_language = native_language
+            if active_language is not None:
+                row.active_language = active_language
+        else:
+            kwargs = {"telegram_id": telegram_id}
+            if native_language is not None:
+                kwargs["native_language"] = native_language
+            if active_language is not None:
+                kwargs["active_language"] = active_language
+            session.add(UserSettings(**kwargs))
 
 
 def add_learning_language(telegram_id: str, lang: str) -> None:
-    """追加新语言到 learning_languages 数组（若不存在则添加，已存在则跳过）"""
-    db = get_client()
-    # 先读取当前值
+    """追加新语言到 learning_languages 数组（已存在则跳过）"""
     try:
-        rows = (
-            db.table("user_settings")
-            .select("learning_languages")
-            .eq("telegram_id", telegram_id)
-            .limit(1)
-            .execute()
-            .data
-        )
+        with _session() as session:
+            row = session.query(UserSettings).filter_by(
+                telegram_id=telegram_id
+            ).first()
+            if row:
+                current = row.learning_languages or ["en"]
+                if not isinstance(current, list):
+                    current = ["en"]
+                if lang not in current:
+                    # 赋值新列表，触发 SQLAlchemy 脏检测
+                    row.learning_languages = current + [lang]
+            else:
+                langs = ["en"] if lang == "en" else ["en", lang]
+                session.add(UserSettings(
+                    telegram_id=telegram_id,
+                    learning_languages=langs,
+                ))
     except Exception:
         return
-
-    current = rows[0].get("learning_languages", ["en"]) if rows else ["en"]
-    if not isinstance(current, list):
-        current = ["en"]
-    if lang not in current:
-        current = current + [lang]
-
-    db.table("user_settings").upsert(
-        {"telegram_id": telegram_id, "learning_languages": current},
-        on_conflict="telegram_id",
-    ).execute()
 
 
 def update_remind_window(telegram_id: str, start_h: int, end_h: int) -> None:
     """upsert 用户推送时段（remind_start/remind_end）"""
-    db = get_client()
-    try:
-        db.table("user_settings").upsert(
-            {
-                "telegram_id": telegram_id,
-                "remind_start": start_h,
-                "remind_end": end_h,
-            },
-            on_conflict="telegram_id",
-        ).execute()
-    except Exception as exc:
-        raise RuntimeError("user_settings 表不存在") from exc
+    with _session() as session:
+        row = session.query(UserSettings).filter_by(
+            telegram_id=telegram_id
+        ).first()
+        if row:
+            row.remind_start = start_h
+            row.remind_end   = end_h
+        else:
+            session.add(UserSettings(
+                telegram_id=telegram_id,
+                remind_start=start_h,
+                remind_end=end_h,
+            ))
 
 
 def set_remind_enabled(telegram_id: str, enabled: bool) -> None:
     """upsert remind_enabled 字段，控制是否接收自动推送"""
-    db = get_client()
-    try:
-        db.table("user_settings").upsert(
-            {
-                "telegram_id": telegram_id,
-                "remind_enabled": enabled,
-            },
-            on_conflict="telegram_id",
-        ).execute()
-    except Exception as exc:
-        raise RuntimeError("user_settings 表不存在") from exc
+    with _session() as session:
+        row = session.query(UserSettings).filter_by(
+            telegram_id=telegram_id
+        ).first()
+        if row:
+            row.remind_enabled = enabled
+        else:
+            session.add(UserSettings(
+                telegram_id=telegram_id,
+                remind_enabled=enabled,
+            ))
 
 
 def update_streak(telegram_id: str) -> None:
@@ -670,106 +769,79 @@ def update_streak(telegram_id: str) -> None:
     - 今天已更新过 → 不变
     - 昨天是 last_active_date → streak_days += 1
     - 超过昨天（断掉）→ streak_days = 1
-    表不存在时静默忽略。
     """
-    db = get_client()
     today = datetime.now(timezone.utc).date()
     try:
-        rows = (
-            db.table("user_settings")
-            .select("streak_days,last_active_date")
-            .eq("telegram_id", telegram_id)
-            .limit(1)
-            .execute()
-            .data
-        )
+        with _session() as session:
+            row = session.query(UserSettings).filter_by(
+                telegram_id=telegram_id
+            ).first()
+            if row:
+                last_date = row.last_active_date  # date 对象或 None
+                streak = row.streak_days or 0
+
+                if last_date:
+                    if last_date == today:
+                        return  # 今天已记录
+                    elif (today - last_date).days == 1:
+                        streak += 1
+                    else:
+                        streak = 1
+                else:
+                    streak = 1
+
+                row.streak_days      = streak
+                row.last_active_date = today
+            else:
+                # 用户设置记录不存在，创建新行
+                session.add(UserSettings(
+                    telegram_id=telegram_id,
+                    streak_days=1,
+                    last_active_date=today,
+                ))
     except Exception:
         return
-
-    if rows:
-        row = rows[0]
-        last_date_str = row.get("last_active_date")
-        streak = row.get("streak_days") or 0
-
-        if last_date_str:
-            from datetime import date
-            last_date = date.fromisoformat(last_date_str)
-            if last_date == today:
-                # 今天已记录，不需要更新
-                return
-            elif (today - last_date).days == 1:
-                # 昨天有记录，连续 +1
-                streak += 1
-            else:
-                # 断掉，重新开始
-                streak = 1
-        else:
-            streak = 1
-
-        try:
-            db.table("user_settings").update(
-                {"streak_days": streak, "last_active_date": today.isoformat()}
-            ).eq("telegram_id", telegram_id).execute()
-        except Exception:
-            return
-    else:
-        # 用户设置记录不存在，创建新行
-        try:
-            db.table("user_settings").upsert(
-                {
-                    "telegram_id": telegram_id,
-                    "streak_days": 1,
-                    "last_active_date": today.isoformat(),
-                },
-                on_conflict="telegram_id",
-            ).execute()
-        except Exception:
-            return
 
 
 def get_streak(telegram_id: str) -> tuple[int, str | None]:
     """
     获取用户连续学习天数和最后活跃日期。
-    返回 (streak_days, last_active_date_str)，表不存在或无记录时返回 (0, None)。
+    返回 (streak_days, last_active_date_str)，无记录时返回 (0, None)。
     """
-    db = get_client()
     try:
-        rows = (
-            db.table("user_settings")
-            .select("streak_days,last_active_date")
-            .eq("telegram_id", telegram_id)
-            .limit(1)
-            .execute()
-            .data
-        )
+        with _session() as session:
+            row = session.query(UserSettings).filter_by(
+                telegram_id=telegram_id
+            ).first()
+            if not row:
+                return 0, None
+            last = row.last_active_date
+            return (row.streak_days or 0), (last.isoformat() if last else None)
     except Exception:
         return 0, None
-    if not rows:
-        return 0, None
-    row = rows[0]
-    return row.get("streak_days") or 0, row.get("last_active_date")
 
 
 def get_expiring_subscriptions(within_days: int = 3) -> list[dict]:
     """返回将在 within_days 天内到期的订阅用户列表"""
-    db = get_client()
-    now = datetime.now(timezone.utc)
-    upper = now + timedelta(days=within_days)
-    rows = (
-        db.table("subscriptions")
-        .select("telegram_id, expires_at")
-        .gt("expires_at", now.isoformat())
-        .lte("expires_at", upper.isoformat())
-        .execute()
-    ).data or []
-    return rows
+    with _session() as session:
+        now   = datetime.now(timezone.utc)
+        upper = now + timedelta(days=within_days)
+        rows  = session.query(Subscription).filter(
+            Subscription.expires_at > now,
+            Subscription.expires_at <= upper,
+        ).all()
+        return [
+            {"telegram_id": r.telegram_id, "expires_at": r.expires_at.isoformat()}
+            for r in rows
+        ]
 
 
 def check_db_connection() -> tuple[bool, str]:
     """测试数据库连接，返回 (ok, message)"""
     try:
-        db = get_client()
-        db.table("vocab_records").select("id").limit(1).execute()
+        from sqlalchemy import text
+        with _session() as session:
+            session.execute(text("SELECT 1"))
         return True, "连接正常"
     except Exception as exc:
         return False, str(exc)[:80]
@@ -777,97 +849,112 @@ def check_db_connection() -> tuple[bool, str]:
 
 def get_all_user_ids() -> list[str]:
     """返回所有有词汇记录的去重用户 telegram_id 列表"""
-    db = get_client()
-    rows = (
-        db.table("vocab_records")
-        .select("telegram_id")
-        .execute()
-        .data
-    )
-    seen: set[str] = set()
-    result: list[str] = []
-    for row in rows:
-        tid = row["telegram_id"]
-        if tid not in seen:
-            seen.add(tid)
-            result.append(tid)
-    return result
+    with _session() as session:
+        rows = (
+            session.query(VocabRecord.telegram_id)
+            .distinct()
+            .all()
+        )
+        return [r.telegram_id for r in rows]
 
 
 def get_admin_stats() -> dict:
     """返回管理员统计数据：total_users / active_7d / pro_users / total_words"""
-    db = get_client()
+    with _session() as session:
+        total_users = session.query(
+            func.count(distinct(VocabRecord.telegram_id))
+        ).scalar() or 0
 
-    # 全部词汇记录，用于统计用户数和总词汇量
-    all_rows = (
-        db.table("vocab_records")
-        .select("telegram_id")
-        .execute()
-        .data
-    ) or []
+        total_words = session.query(
+            func.count(VocabRecord.id)
+        ).scalar() or 0
 
-    # 去重用户集合
-    all_users: set[str] = {r["telegram_id"] for r in all_rows}
-    total_users = len(all_users)
-    total_words = len(all_rows)
+        seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+        active_7d = session.query(
+            func.count(distinct(VocabRecord.telegram_id))
+        ).filter(VocabRecord.created_at >= seven_days_ago).scalar() or 0
 
-    # 7 日内有新增词汇的用户（近似活跃）
-    from datetime import timedelta
-    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-    active_rows = (
-        db.table("vocab_records")
-        .select("telegram_id")
-        .gte("created_at", seven_days_ago)
-        .execute()
-        .data
-    ) or []
-    active_7d = len({r["telegram_id"] for r in active_rows})
+        now = datetime.now(timezone.utc)
+        try:
+            pro_users = session.query(
+                func.count(Subscription.telegram_id)
+            ).filter(Subscription.expires_at > now).scalar() or 0
+        except Exception:
+            pro_users = 0
 
-    # Pro 用户数（subscriptions 表，expires_at > now）
-    try:
-        sub_rows = (
-            db.table("subscriptions")
-            .select("telegram_id")
-            .gt("expires_at", datetime.now(timezone.utc).isoformat())
-            .execute()
-            .data
-        ) or []
-        pro_users = len(sub_rows)
-    except Exception:
-        pro_users = 0
-
-    return {
-        "total_users": total_users,
-        "active_7d": active_7d,
-        "pro_users": pro_users,
-        "total_words": total_words,
-    }
+        return {
+            "total_users": total_users,
+            "active_7d":   active_7d,
+            "pro_users":   pro_users,
+            "total_words": total_words,
+        }
 
 
 def update_vocab_fields(record_id: str, fields: dict) -> bool:
     """更新词汇的可编辑字段（pos/definition/context），返回是否成功"""
-    # 只允许编辑这三个字段
     allowed = {"pos", "definition", "context"}
     safe_fields = {k: v for k, v in fields.items() if k in allowed}
     if not safe_fields:
         return False
-    db = get_client()
-    result = (
-        db.table("vocab_records")
-        .update(safe_fields)
-        .eq("id", record_id)
-        .execute()
-    )
-    return bool(result.data)
+    with _session() as session:
+        row = session.query(VocabRecord).filter_by(id=int(record_id)).first()
+        if row is None:
+            return False
+        for k, v in safe_fields.items():
+            setattr(row, k, v)
+        return True
 
 
 def set_user_timezone(telegram_id: str, timezone_str: str) -> None:
-    """设置用户时区（upsert）。表不存在时抛出 RuntimeError 告知上层。"""
-    db = get_client()
-    try:
-        db.table("user_settings").upsert(
-            {"telegram_id": telegram_id, "timezone": timezone_str},
-            on_conflict="telegram_id",
-        ).execute()
-    except Exception as exc:
-        raise RuntimeError("user_settings 表不存在") from exc
+    """设置用户时区（upsert）"""
+    with _session() as session:
+        row = session.query(UserSettings).filter_by(
+            telegram_id=telegram_id
+        ).first()
+        if row:
+            row.timezone = timezone_str
+        else:
+            session.add(UserSettings(
+                telegram_id=telegram_id,
+                timezone=timezone_str,
+            ))
+
+
+def set_proficiency_level(
+    telegram_id: str, level: int, mark_done: bool = True
+) -> None:
+    """设置用户词汇水平（1-5），并可选标记评估完成"""
+    with _session() as session:
+        row = session.query(UserSettings).filter_by(
+            telegram_id=telegram_id
+        ).first()
+        if row:
+            row.proficiency_level = level
+            if mark_done:
+                row.assessment_done = True
+        else:
+            session.add(UserSettings(
+                telegram_id=telegram_id,
+                proficiency_level=level,
+                assessment_done=mark_done,
+            ))
+
+
+def get_recent_word_levels(telegram_id: str, limit: int = 50) -> float | None:
+    """
+    返回用户最近 limit 条词汇的平均 word_level（只计有 word_level 的记录）。
+    若无有效数据则返回 None。
+    """
+    with _session() as session:
+        rows = (
+            session.query(VocabRecord.word_level)
+            .filter(
+                VocabRecord.telegram_id == telegram_id,
+                VocabRecord.word_level.isnot(None),
+            )
+            .order_by(VocabRecord.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        levels = [r.word_level for r in rows if r.word_level is not None]
+        return sum(levels) / len(levels) if levels else None

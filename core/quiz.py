@@ -1,8 +1,11 @@
 """
 测验生成模块：从词库中选取到期词汇，生成选择题
-支持两种题型：
+支持题型：
 - fill（填空题）：4个选项（2行×2列）+ "跳过"按钮
-- meaning（选义题）：4个中文释义选项（2行×2列）+ "模糊/拿不准"按钮
+- meaning（选义题）：4个母语释义选项（2行×2列）+ "模糊/拿不准"按钮
+- synonym（同义词辨析题）：4个近义词选项
+- reverse（反向选词题）：给出母语释义，选出正确目标语言单词
+- generation（造句题）：用户造句，AI 评分
 支持多语言：通过 target_language 指定学习语言
 """
 import re
@@ -50,13 +53,16 @@ class QuizQuestion:
     record_id: str          # vocab_records.id，用于答题后更新
     word: str               # 目标单词
     definition: str         # 目标单词释义
-    sentence: str           # 例句（fill题含______占位符，meaning题为原始例句）
-    correct_answer: str     # 正确选项文本（fill题为word，meaning题为definition）
-    options: list[str]      # 4 个选项（已打乱顺序）
-    correct_index: int      # 正确选项在 options 中的下标
-    quiz_type: str          # "fill" 或 "meaning"
+    sentence: str           # 例句（fill题含______占位符，meaning/reverse题为原始例句，generation题为参考例句）
+    correct_answer: str     # 正确选项文本（fill/reverse题为word，meaning题为definition，synonym题为同义词，generation题为空）
+    options: list[str]      # 4 个选项（fill/meaning/synonym/reverse题），generation题为空列表
+    correct_index: int      # 正确选项在 options 中的下标（generation题为 -1）
+    quiz_type: str          # "fill" | "meaning" | "synonym" | "reverse" | "generation"
     practice_mode: bool = False  # True 时答题不触发 SM-2 更新
     target_language: str = "en"  # 该题目对应的学习语言
+    ease_factor: float = 2.5     # 当前 ease_factor（generation 造句题评分使用）
+    native_language: str = "zh"  # 母语（generation 题反馈语言使用）
+    level: int = 0               # 当前 SM-2 level（generation 题使用）
 
 
 async def build_quiz(
@@ -65,13 +71,15 @@ async def build_quiz(
     target_language: str = "en",
     native_language: str = "zh",
     force_vocab: dict | None = None,
+    allow_generation: bool = True,
 ) -> QuizQuestion | None:
     """
     为指定用户生成一道复习题。
-    随机在 fill（填空题）和 meaning（选义题）中选一种。
+    按 SM-2 level 决定题型，包含 reverse 反向选词题。
     practice_mode=True 时从全部词库取词，答题不触发 SM-2 更新。
     target_language 指定学习语言，过滤词库。
     force_vocab: 直接指定本题目标词（跳过随机选取），用于 shuffle 队列模式。
+    allow_generation: 为 False 时（如调度器推送）跳过 generation 题，fallback 到 fill 题。
     若无可用词汇则返回 None。
     """
     # 1. 根据模式获取词汇列表，随机选一条（同时按 native_language 过滤，避免跨母语混词）
@@ -95,8 +103,27 @@ async def build_quiz(
     record_id = target["id"]
     word = target["word"]
     definition = target["definition"]
+    sm2_level = target.get("level", 0)
 
-    # 2. 获取同语言同母语干扰项，避免不同母语释义混入
+    # 2. 根据 SM-2 level 决定题型（含 reverse 反向选词题）
+    #    Level 0-1: fill / meaning / reverse 随机（三选一，均衡训练）
+    #    Level 2-3: fill / reverse（强化拼写+产出）
+    #    Level 4-5: fill / synonym / reverse（加入近义词辨析）
+    #    Level 6-7: generation（造句 + AI 评分）
+    if sm2_level <= 1:
+        quiz_type = random.choice(["fill", "meaning", "reverse"])
+    elif sm2_level <= 3:
+        quiz_type = random.choice(["fill", "reverse"])
+    elif sm2_level <= 5:
+        quiz_type = random.choice(["fill", "synonym", "reverse"])
+    else:
+        quiz_type = "generation"
+
+    # 调度器场景无法设置 pending_generation，generation 题 fallback 到 fill
+    if not allow_generation and quiz_type == "generation":
+        quiz_type = "fill"
+
+    # 3. 获取同语言同母语干扰项（fill/meaning/synonym/reverse 题需要）
     distractors_raw = get_random_words_for_distractor(
         telegram_id, record_id, count=3,
         target_language=target_language,
@@ -104,18 +131,37 @@ async def build_quiz(
     )
     random.shuffle(distractors_raw)
 
-    # 3. 随机决定题型
-    quiz_type = random.choice(["fill", "meaning"])
-
     if quiz_type == "fill":
         return await _build_fill_quiz(
             target, record_id, word, definition,
             distractors_raw, practice_mode, target_language, native_language
         )
-    else:
+    elif quiz_type == "meaning":
         return await _build_meaning_quiz(
             target, record_id, word, definition,
             distractors_raw, practice_mode, target_language, native_language
+        )
+    elif quiz_type == "synonym":
+        result = await _build_synonym_quiz(
+            target, record_id, word, definition,
+            distractors_raw, practice_mode, target_language, native_language
+        )
+        # synonym 题若无同义词缓存，fallback 到 meaning 题
+        if result is not None:
+            return result
+        return await _build_meaning_quiz(
+            target, record_id, word, definition,
+            distractors_raw, practice_mode, target_language, native_language
+        )
+    elif quiz_type == "reverse":
+        return _build_reverse_quiz(
+            target, record_id, word, definition,
+            distractors_raw, practice_mode, target_language, native_language
+        )
+    else:  # generation
+        return _build_generation_quiz(
+            target, record_id, word, definition,
+            practice_mode, target_language, native_language
         )
 
 
@@ -130,7 +176,8 @@ async def _build_fill_quiz(
     native_language: str = "zh",
 ) -> QuizQuestion:
     """
-    构建填空题：AI 生成目标语言例句，4个词汇选项
+    构建填空题：AI 生成目标语言例句，4个词汇选项。
+    优先使用 quiz_synonyms[1:] 作为语义相近的干扰项（比随机词更难区分）。
     """
     # 生成新例句（避免与入库时相同）
     try:
@@ -202,9 +249,22 @@ async def _build_fill_quiz(
             sentence = f"______ — {definition}"
         logger.info("填空题答案泄露（兜底），已回退：%s", sentence)
 
-    # 用 fallback 词补足干扰项（词库不足时，按目标语言选词）
+    # 优先使用 quiz_synonyms[1:] 作为语义相近干扰项（更难区分，测验质量更高）
+    quiz_synonyms = target.get("quiz_synonyms") or []
+    near_synonyms = [s for s in quiz_synonyms[1:4] if s and s.lower() != word.lower()]
+
+    distractor_words: list[str] = near_synonyms[:3]
+
+    # 不足时补充随机词库词
     fallback_words = _FALLBACK_WORDS.get(target_language, _FALLBACK_WORDS["en"])
-    distractor_words: list[str] = [d["word"] for d in distractors_raw[:3]]
+    for d in distractors_raw:
+        if len(distractor_words) >= 3:
+            break
+        w = d.get("word", "")
+        if w and w.lower() != word.lower() and w not in distractor_words:
+            distractor_words.append(w)
+
+    # 最终用 fallback 词补足
     while len(distractor_words) < 3:
         fb = random.choice(fallback_words)
         if fb != word and fb not in distractor_words:
@@ -229,6 +289,9 @@ async def _build_fill_quiz(
         quiz_type="fill",
         practice_mode=practice_mode,
         target_language=target_language,
+        ease_factor=target.get("ease_factor", 2.5),
+        native_language=native_language,
+        level=target.get("level", 0),
     )
 
 
@@ -243,7 +306,8 @@ async def _build_meaning_quiz(
     native_language: str = "zh",
 ) -> QuizQuestion:
     """
-    构建选义题：AI 生成新例句（不含占位符），4个母语释义选项
+    构建选义题：AI 生成新例句（不含占位符），4个母语释义选项。
+    优先尝试从 quiz_synonyms[1:] 的词库记录中获取 definition 作干扰释义。
     """
     # 调用 AI 生成多样化例句，展示单词在真实语境中的用法
     try:
@@ -254,13 +318,35 @@ async def _build_meaning_quiz(
         logger.warning("选义题生成例句失败，使用入库 context: %s", exc)
         sentence = target.get("context") or f"She used the word {word} in her speech."
 
-    # 从干扰项中取 definition 作混淆选项（按母语选 fallback，确保语言一致）
+    # 尝试从 quiz_synonyms[1:] 的词库记录中获取 definition 作干扰释义
+    distractor_defs: list[str] = []
+    quiz_synonyms = target.get("quiz_synonyms") or []
+    near_synonyms = [s for s in quiz_synonyms[1:4] if s]
+    if near_synonyms:
+        from database.client import get_vocab_by_word
+        telegram_id = target.get("telegram_id", "")
+        for syn in near_synonyms:
+            if len(distractor_defs) >= 3:
+                break
+            try:
+                syn_records = get_vocab_by_word(telegram_id, syn, target_language=target_language)
+                if syn_records:
+                    d = syn_records[0].get("definition", "")
+                    if d and d != definition and d not in distractor_defs:
+                        distractor_defs.append(d)
+            except Exception:
+                pass
+
+    # 从随机词库补足干扰释义（按母语选 fallback，确保语言一致）
+    for d in distractors_raw[:3]:
+        if len(distractor_defs) >= 3:
+            break
+        df = d.get("definition", "")
+        if df and df != definition and df not in distractor_defs:
+            distractor_defs.append(df)
+
+    # 最终用 fallback 释义补足到3条
     fallback_definitions = _FALLBACK_DEFS.get(native_language, _FALLBACK_DEFS["en"])
-    distractor_defs: list[str] = [
-        d["definition"] for d in distractors_raw[:3]
-        if d.get("definition") and d["definition"] != definition
-    ]
-    # 补足到3条干扰项
     fb_idx = 0
     while len(distractor_defs) < 3 and fb_idx < len(fallback_definitions):
         fb = fallback_definitions[fb_idx]
@@ -283,4 +369,154 @@ async def _build_meaning_quiz(
         quiz_type="meaning",
         practice_mode=practice_mode,
         target_language=target_language,
+        ease_factor=target.get("ease_factor", 2.5),
+        native_language=native_language,
+        level=target.get("level", 0),
+    )
+
+
+async def _build_synonym_quiz(
+    target: dict,
+    record_id: str,
+    word: str,
+    definition: str,
+    distractors_raw: list[dict],
+    practice_mode: bool = False,
+    target_language: str = "en",
+    native_language: str = "zh",
+) -> QuizQuestion | None:
+    """
+    构建同义词辨析题：目标词 + 4 选项（quiz_synonyms 缓存数据）。
+    若 quiz_synonyms 为空则返回 None，由调用方 fallback 到 meaning 题。
+    """
+    quiz_synonyms = target.get("quiz_synonyms") or []
+
+    # 需要至少 1 个正确同义词 + 3 个干扰项（可从 quiz_synonyms 或随机词库补足）
+    if not quiz_synonyms or not quiz_synonyms[0]:
+        return None
+
+    correct_synonym = quiz_synonyms[0]
+    # 使用缓存的错误近义词（index 1-3），不足时从词库随机词补足
+    wrong_options = [s for s in quiz_synonyms[1:4] if s]
+    while len(wrong_options) < 3:
+        fallback = random.choice(distractors_raw) if distractors_raw else None
+        if fallback and fallback.get("word") and fallback["word"] not in wrong_options:
+            wrong_options.append(fallback["word"])
+        elif len(wrong_options) < 3:
+            # 最终兜底：用随机常见词
+            wrong_options.append(random.choice(["common", "normal", "typical", "usual"]))
+
+    options = [correct_synonym] + wrong_options[:3]
+    random.shuffle(options)
+    correct_index = options.index(correct_synonym)
+
+    # 用词条的 context 例句，或直接展示词 + 释义
+    context_sentence = target.get("context") or f"She demonstrated {word} in her work."
+
+    return QuizQuestion(
+        record_id=record_id,
+        word=word,
+        definition=definition,
+        sentence=context_sentence,
+        correct_answer=correct_synonym,
+        options=options,
+        correct_index=correct_index,
+        quiz_type="synonym",
+        practice_mode=practice_mode,
+        target_language=target_language,
+        ease_factor=target.get("ease_factor", 2.5),
+        native_language=native_language,
+        level=target.get("level", 0),
+    )
+
+
+def _build_reverse_quiz(
+    target: dict,
+    record_id: str,
+    word: str,
+    definition: str,
+    distractors_raw: list[dict],
+    practice_mode: bool = False,
+    target_language: str = "en",
+    native_language: str = "zh",
+) -> QuizQuestion:
+    """
+    构建反向选词题：给出母语释义，选出正确的目标语言单词（测产出能力）。
+    干扰项优先用 quiz_synonyms[1:] 的近义词，使题目更难。
+    使用 quiz: callback 前缀，与 fill 题判对逻辑相同。
+    """
+    # 优先用 quiz_synonyms[1:] 的近义词作干扰项（语义相近，更难区分）
+    quiz_synonyms = target.get("quiz_synonyms") or []
+    near_synonyms = [s for s in quiz_synonyms[1:4] if s and s.lower() != word.lower()]
+    distractor_words: list[str] = near_synonyms[:3]
+
+    # 不足时从词库随机词补足
+    fallback_words = _FALLBACK_WORDS.get(target_language, _FALLBACK_WORDS["en"])
+    for d in distractors_raw:
+        if len(distractor_words) >= 3:
+            break
+        w = d.get("word", "")
+        if w and w.lower() != word.lower() and w not in distractor_words:
+            distractor_words.append(w)
+
+    # 最终 fallback 补足
+    while len(distractor_words) < 3:
+        fb = random.choice(fallback_words)
+        if fb != word and fb not in distractor_words:
+            distractor_words.append(fb)
+
+    options = [word] + distractor_words[:3]
+    random.shuffle(options)
+    correct_index = options.index(word)
+
+    # 以存储的 context 例句作为辅助语境提示
+    context_sentence = target.get("context") or ""
+
+    return QuizQuestion(
+        record_id=record_id,
+        word=word,
+        definition=definition,
+        sentence=context_sentence,
+        correct_answer=word,
+        options=options,
+        correct_index=correct_index,
+        quiz_type="reverse",
+        practice_mode=practice_mode,
+        target_language=target_language,
+        ease_factor=target.get("ease_factor", 2.5),
+        native_language=native_language,
+        level=target.get("level", 0),
+    )
+
+
+def _build_generation_quiz(
+    target: dict,
+    record_id: str,
+    word: str,
+    definition: str,
+    practice_mode: bool = False,
+    target_language: str = "en",
+    native_language: str = "zh",
+) -> QuizQuestion:
+    """
+    构建造句题：用户需在聊天框输入包含目标词的句子，由 AI 评分。
+    不需要 AI 异步调用，直接返回（句子评分在用户提交后异步执行）。
+    """
+    # 用入库时的例句作为参考提示
+    context_sentence = target.get("context") or f"Use '{word}' in a sentence."
+
+    return QuizQuestion(
+        record_id=record_id,
+        word=word,
+        definition=definition,
+        sentence=context_sentence,       # 展示给用户的参考例句
+        correct_answer="",               # 无固定正确答案
+        options=[],                      # 无选项
+        correct_index=-1,
+        quiz_type="generation",
+        practice_mode=practice_mode,
+        target_language=target_language,
+        ease_factor=target.get("ease_factor", 2.5),
+        native_language=native_language,
+        level=target.get("level", 0),
     )

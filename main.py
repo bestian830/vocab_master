@@ -15,11 +15,13 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_BOT_TOKEN, PORT, WEBHOOK_URL
+from database.client import init_db
 from bot.handlers.commands import (
     cmd_start, cmd_help, cmd_vocab, cmd_review, cmd_practice, cmd_streak,
     cmd_activate, cmd_plan, cmd_gencode, cmd_extend, cmd_stats,
     cmd_delete, cmd_search, cmd_export, cmd_timezone, cmd_health,
     cmd_broadcast, cmd_users, cmd_update, cmd_settings, cmd_language,
+    cmd_level,
 )
 from bot.handlers.messages import handle_text_message
 from bot.handlers.callbacks import handle_callback
@@ -39,6 +41,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("vocab",    "Browse your word list"),
         BotCommand("review",   "Start a review session"),
         BotCommand("practice", "Free practice mode"),
+        BotCommand("level",    "Set your vocabulary proficiency level"),
         BotCommand("language", "Manage learning languages"),
         BotCommand("search",   "Search your vocabulary"),
         BotCommand("update",   "Edit a vocab entry"),
@@ -56,6 +59,10 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
+    # 自动建表（表已存在则跳过）
+    init_db()
+    logger.info("DB 初始化完成")
+
     # 构建 Application，post_init 在 bot 准备好后自动调用
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
 
@@ -81,6 +88,7 @@ def main() -> None:
     app.add_handler(CommandHandler("update",    cmd_update))
     app.add_handler(CommandHandler("settings",  cmd_settings))
     app.add_handler(CommandHandler("language",  cmd_language))
+    app.add_handler(CommandHandler("level",     cmd_level))
 
     # ── 注册普通文本消息处理器（排除命令）────────────────────────────────────
     app.add_handler(
@@ -91,8 +99,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     # ── 启动调度器 ────────────────────────────────────────────────────────────
-    bot = app.bot
-    scheduler = setup_scheduler(bot)
+    scheduler = setup_scheduler(app)  # 传 app，供 cleanup job 访问 user_data
     scheduler.start()
     app.bot_data["scheduler"] = scheduler   # 供 /health 访问
     logger.info("APScheduler 已启动")
