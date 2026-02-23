@@ -4,6 +4,7 @@
 """
 import secrets
 import string
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta, date
 
@@ -12,7 +13,7 @@ from sqlalchemy import (
     Boolean, Date, UniqueConstraint, func, distinct, text,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.dialects.postgresql import ARRAY, insert as pg_insert
+from sqlalchemy.dialects.postgresql import ARRAY, UUID as PgUUID, insert as pg_insert
 
 from config import DATABASE_URL, ADMIN_TELEGRAM_ID
 
@@ -25,7 +26,7 @@ Base = declarative_base()
 class VocabRecord(Base):
     __tablename__ = "vocab_records"
 
-    id              = Column(Integer, primary_key=True, autoincrement=True)
+    id              = Column(PgUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     telegram_id     = Column(String, nullable=False, index=True)
     word            = Column(String, nullable=False)
     pos             = Column(String)
@@ -152,7 +153,7 @@ def init_db() -> None:
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
 def _row_to_dict(row) -> dict:
-    """将 ORM 行对象转为 dict，兼容原 Supabase 返回格式（datetime → isoformat）"""
+    """将 ORM 行对象转为 dict，兼容原 Supabase 返回格式（datetime/UUID → str）"""
     d = {}
     for c in row.__table__.columns:
         v = getattr(row, c.name)
@@ -161,19 +162,23 @@ def _row_to_dict(row) -> dict:
             d[c.name] = v.isoformat()
         elif isinstance(v, date):
             d[c.name] = v.isoformat()
+        elif isinstance(v, uuid.UUID):
+            d[c.name] = str(v)
         else:
             d[c.name] = v
     return d
 
 
 def _convert_row_dict(d: dict) -> dict:
-    """将 _asdict() 结果中的 datetime/date 值统一转为 isoformat 字符串"""
+    """将 _asdict() 结果中的 datetime/date/UUID 值统一转为字符串"""
     result = {}
     for k, v in d.items():
         if isinstance(v, datetime):
             result[k] = v.isoformat()
         elif isinstance(v, date):
             result[k] = v.isoformat()
+        elif isinstance(v, uuid.UUID):
+            result[k] = str(v)
         else:
             result[k] = v
     return result
@@ -336,7 +341,7 @@ def update_vocab_after_review(
     tid = telegram_id
 
     with _session() as session:
-        row = session.query(VocabRecord).filter_by(id=int(record_id)).first()
+        row = session.query(VocabRecord).filter_by(id=uuid.UUID(record_id)).first()
         if row:
             row.level        = level
             row.next_review  = next_review_dt
@@ -470,7 +475,7 @@ def generate_codes(duration_days: int, count: int) -> list[str]:
 def delete_vocab_by_id(record_id: str) -> bool:
     """按主键删除单条词汇记录，返回是否删除成功"""
     with _session() as session:
-        row = session.query(VocabRecord).filter_by(id=int(record_id)).first()
+        row = session.query(VocabRecord).filter_by(id=uuid.UUID(record_id)).first()
         if row is None:
             return False
         session.delete(row)
@@ -581,7 +586,7 @@ def get_random_words_for_distractor(
         ).filter(
             VocabRecord.telegram_id == telegram_id,
             VocabRecord.target_language == target_language,
-            VocabRecord.id != int(exclude_id),
+            VocabRecord.id != uuid.UUID(exclude_id),
         )
         if native_language:
             query = query.filter(VocabRecord.native_language == native_language)
@@ -610,7 +615,7 @@ def get_all_vocab(telegram_id: str) -> list[dict]:
 def get_vocab_detail(record_id: str) -> dict | None:
     """按主键取单条完整词汇记录"""
     with _session() as session:
-        row = session.query(VocabRecord).filter_by(id=int(record_id)).first()
+        row = session.query(VocabRecord).filter_by(id=uuid.UUID(record_id)).first()
         return _row_to_dict(row) if row else None
 
 
@@ -897,7 +902,7 @@ def update_vocab_fields(record_id: str, fields: dict) -> bool:
     if not safe_fields:
         return False
     with _session() as session:
-        row = session.query(VocabRecord).filter_by(id=int(record_id)).first()
+        row = session.query(VocabRecord).filter_by(id=uuid.UUID(record_id)).first()
         if row is None:
             return False
         for k, v in safe_fields.items():
