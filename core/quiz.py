@@ -154,7 +154,7 @@ async def build_quiz(
             distractors_raw, practice_mode, target_language, native_language
         )
     elif quiz_type == "reverse":
-        return _build_reverse_quiz(
+        return await _build_reverse_quiz(
             target, record_id, word, definition,
             distractors_raw, practice_mode, target_language, native_language
         )
@@ -430,7 +430,7 @@ async def _build_synonym_quiz(
     )
 
 
-def _build_reverse_quiz(
+async def _build_reverse_quiz(
     target: dict,
     record_id: str,
     word: str,
@@ -469,8 +469,23 @@ def _build_reverse_quiz(
     random.shuffle(options)
     correct_index = options.index(word)
 
-    # 以存储的 context 例句作为辅助语境提示
-    context_sentence = target.get("context") or ""
+    # 调用 AI 生成含 ______ 占位符的例句，避免原始 context 暴露答案
+    try:
+        context_sentence = await generate_quiz_sentence(word, definition, target_language=target_language)
+    except Exception as exc:
+        logger.warning("反向选词题生成例句失败，回退到原始 context: %s", exc)
+        context_sentence = target.get("context") or ""
+
+    # 与 fill 题相同后处理：提取含占位符的行，统一为 ______
+    if context_sentence:
+        lines = [l.strip() for l in context_sentence.splitlines() if l.strip()]
+        placeholder_lines = [l for l in lines if "___" in l]
+        if placeholder_lines:
+            context_sentence = placeholder_lines[0]
+        elif lines:
+            context_sentence = lines[0]
+        context_sentence = context_sentence.replace("___", "______")
+        context_sentence = re.sub(re.escape(word), "______", context_sentence, flags=re.IGNORECASE)
 
     return QuizQuestion(
         record_id=record_id,
