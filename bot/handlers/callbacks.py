@@ -904,6 +904,20 @@ async def _handle_settings_callback(query, telegram_id: str, data: str, context=
         except Exception:
             pass
 
+    elif action == "toggle_review_scope":
+        current = settings.get("review_active_only", True)
+        try:
+            from database.client import set_review_active_only
+            set_review_active_only(telegram_id, not current)
+        except Exception as exc:
+            logger.error("切换复习范围失败: %s", exc)
+        settings = get_user_settings(telegram_id)
+        text, keyboard = await _build_settings_panel(settings, lang)
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception:
+            pass
+
     elif action == "back":
         settings = get_user_settings(telegram_id)
         text, keyboard = await _build_settings_panel(settings, lang)
@@ -919,17 +933,27 @@ async def _build_settings_panel(settings: dict, lang: str = "zh") -> tuple[str, 
     start_h = settings.get("remind_start", 8)
     end_h = settings.get("remind_end", 22)
     enabled = settings.get("remind_enabled", True)
+    review_active_only = settings.get("review_active_only", True)
 
     status = await t_async("settings_push_on" if enabled else "settings_push_off", lang)
     toggle_label = await t_async("settings_toggle_off" if enabled else "settings_toggle_on", lang)
+
+    # 复习范围文案
+    scope_status = await t_async(
+        "settings_review_scope_on" if review_active_only else "settings_review_scope_off", lang
+    )
+    scope_line = await t_async("settings_review_scope_label", lang, status=scope_status)
+    scope_toggle_label = await t_async(
+        "settings_toggle_review_scope_off" if review_active_only else "settings_toggle_review_scope_on", lang
+    )
 
     title = await t_async("settings_title", lang)
     tz_line = await t_async("settings_tz_line", lang, tz=tz)
     window_line = await t_async("settings_window_line", lang, start=f"{start_h:02d}", end=f"{end_h:02d}")
     push_line = await t_async("settings_push_label", lang, status=status)
 
-    text = f"{title}\n\n{tz_line}\n{window_line}\n{push_line}"
-    keyboard = await settings_panel_keyboard(toggle_label, lang=lang)
+    text = f"{title}\n\n{tz_line}\n{window_line}\n{push_line}\n{scope_line}"
+    keyboard = await settings_panel_keyboard(toggle_label, lang=lang, review_scope_label=scope_toggle_label)
     return text, keyboard
 
 

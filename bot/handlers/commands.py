@@ -414,9 +414,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lang = native_language
 
     total = count_vocab(telegram_id, target_language=active_language)
-    today_added = get_today_add_count(telegram_id)
+    today_added = get_today_add_count(telegram_id, target_language=active_language)
     due_count = len(get_due_vocab(telegram_id, target_language=active_language))
-    dist = get_level_distribution(telegram_id)
+    dist = get_level_distribution(telegram_id, target_language=active_language)
     lang_counts = get_vocab_count_by_language(telegram_id)
 
     lang_display = get_language_display(active_language)
@@ -975,20 +975,30 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     start_h = settings.get("remind_start", 8)
     end_h = settings.get("remind_end", 22)
     enabled = settings.get("remind_enabled", True)
+    review_active_only = settings.get("review_active_only", True)
 
     status = await t_async("settings_push_on" if enabled else "settings_push_off", lang)
     toggle_label = await t_async("settings_toggle_off" if enabled else "settings_toggle_on", lang)
+
+    # 复习范围文案
+    scope_status = await t_async(
+        "settings_review_scope_on" if review_active_only else "settings_review_scope_off", lang
+    )
+    scope_line = await t_async("settings_review_scope_label", lang, status=scope_status)
+    scope_toggle_label = await t_async(
+        "settings_toggle_review_scope_off" if review_active_only else "settings_toggle_review_scope_on", lang
+    )
 
     title = await t_async("settings_title", lang)
     tz_line = await t_async("settings_tz_line", lang, tz=tz)
     window_line = await t_async("settings_window_line", lang, start=f"{start_h:02d}", end=f"{end_h:02d}")
     push_line = await t_async("settings_push_label", lang, status=status)
 
-    text = f"{title}\n\n{tz_line}\n{window_line}\n{push_line}"
+    text = f"{title}\n\n{tz_line}\n{window_line}\n{push_line}\n{scope_line}"
     await update.message.reply_text(
         text,
         parse_mode="Markdown",
-        reply_markup=await settings_panel_keyboard(toggle_label, lang=lang),
+        reply_markup=await settings_panel_keyboard(toggle_label, lang=lang, review_scope_label=scope_toggle_label),
     )
 
 

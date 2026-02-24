@@ -29,6 +29,20 @@ _SENTENCE_SCENARIOS = [
     "historical or cultural context",
 ]
 
+# ── 混语检测工具函数 ─────────────────────────────────────────────────────────
+
+def _contains_cjk(text: str) -> bool:
+    """检测文本是否包含 CJK 字符"""
+    return bool(re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', text))
+
+
+def _is_mixed_language(text: str, target_language: str) -> bool:
+    """非 CJK 目标语言的句子不应含 CJK 字符"""
+    if target_language in ("zh", "ja", "ko"):
+        return False
+    return _contains_cjk(text)
+
+
 # ── 初始化 OpenAI 兼容客户端 ─────────────────────────────────────────────────
 
 _ai_client = AsyncOpenAI(
@@ -411,7 +425,9 @@ async def generate_example_sentence(
     prompt = (
         f'Word: "{word}" ({definition})\n'
         f"Scenario: {scenario}\n"
-        f"Write one natural {lang_name} example sentence using this word. "
+        f"Write one natural {lang_name} example sentence using this word.\n"
+        f"The sentence must be written ENTIRELY in {lang_name}. "
+        f"Do NOT include any words from other languages.\n"
         f"Output only the sentence."
     )
     resp = await _ai_client.chat.completions.create(
@@ -421,15 +437,41 @@ async def generate_example_sentence(
                 "role": "system",
                 "content": (
                     f"You are a {lang_name} vocabulary teaching assistant. "
-                    f"Output only the example sentence, nothing else."
+                    f"Output only the example sentence in pure {lang_name}. "
+                    f"Never mix other languages."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
         max_tokens=100,
-        temperature=0.9,
+        temperature=0.7,
     )
-    return resp.choices[0].message.content.strip()
+    result = resp.choices[0].message.content.strip()
+
+    # 混语检测：非 CJK 语言的句子不应含 CJK 字符
+    if _is_mixed_language(result, target_language):
+        logger.warning("generate_example_sentence 混语检测: %s", result)
+        retry_resp = await _ai_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are a {lang_name} vocabulary teaching assistant. "
+                        f"Output ONLY a sentence in pure {lang_name}. "
+                        f"ABSOLUTELY NO Chinese, Japanese, or Korean characters allowed."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=100,
+            temperature=0.5,
+        )
+        retry_result = retry_resp.choices[0].message.content.strip()
+        if not _is_mixed_language(retry_result, target_language):
+            result = retry_result
+
+    return result
 
 
 async def generate_quiz_sentence(
@@ -457,7 +499,9 @@ async def generate_quiz_sentence(
         f"do NOT place that same word immediately before the ______.\n"
         f"   Bad:  'She was stuck in ______ for weeks.'\n"
         f"   Good: 'Her application sat ______ for weeks.'\n"
-        f"Example: For 'give up' → output: Don't ______ just because it's hard.\n"
+        f"5. Use a POSITIVE or NEUTRAL context that demonstrates the word's meaning naturally.\n"
+        f"6. The sentence MUST make complete sense when the blank is filled with '{word}'.\n"
+        f"7. Write the sentence ENTIRELY in {lang_name}. Do NOT mix any other language.\n"
         f"Important: The word/phrase '{word}' must NOT appear anywhere in the output."
     )
     response = await _ai_client.chat.completions.create(
@@ -467,15 +511,39 @@ async def generate_quiz_sentence(
                 "role": "system",
                 "content": (
                     f"You are a {lang_name} vocabulary teaching assistant. "
-                    f"Output only the fill-in-the-blank sentence."
+                    f"Output only the fill-in-the-blank sentence in pure {lang_name}. "
+                    f"Never mix other languages."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
-        temperature=0.9,
+        temperature=0.7,
         max_tokens=100,
     )
     result = response.choices[0].message.content.strip()
+
+    # 混语检测：非 CJK 语言的句子不应含 CJK 字符
+    if _is_mixed_language(result, target_language):
+        logger.warning("generate_quiz_sentence 混语检测: %s", result)
+        retry_resp = await _ai_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are a {lang_name} vocabulary teaching assistant. "
+                        f"Output ONLY a fill-in-the-blank sentence in pure {lang_name}. "
+                        f"ABSOLUTELY NO Chinese, Japanese, or Korean characters allowed."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=100,
+            temperature=0.5,
+        )
+        retry_result = retry_resp.choices[0].message.content.strip()
+        if not _is_mixed_language(retry_result, target_language):
+            result = retry_result
 
     # 若 AI 没有正确生成占位符，手动将原词替换为 ______
     if "___" not in result:

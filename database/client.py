@@ -88,6 +88,8 @@ class UserSettings(Base):
     active_language    = Column(String, default="en", nullable=False)
     learning_languages = Column(ARRAY(String), default=["en"], nullable=False)
     updated_at         = Column(DateTime(timezone=True), server_default=func.now())
+    # 定时复习范围：True=仅推送当前激活语言，False=推送所有语言
+    review_active_only = Column(Boolean, default=True, nullable=False)
     # 词汇水平评估相关
     proficiency_level  = Column(Integer, default=0, nullable=False)   # 0=未评估, 1-5 词汇水平
     assessment_done    = Column(Boolean, default=False, nullable=False)  # 是否完成了 onboarding 评估
@@ -145,8 +147,27 @@ def init_db() -> None:
         """))
         session.execute(text("""
             ALTER TABLE user_settings
-              ADD COLUMN IF NOT EXISTS proficiency_level INTEGER NOT NULL DEFAULT 0,
-              ADD COLUMN IF NOT EXISTS assessment_done   BOOLEAN NOT NULL DEFAULT FALSE
+              ADD COLUMN IF NOT EXISTS proficiency_level    INTEGER NOT NULL DEFAULT 0,
+              ADD COLUMN IF NOT EXISTS assessment_done      BOOLEAN NOT NULL DEFAULT FALSE,
+              ADD COLUMN IF NOT EXISTS review_active_only   BOOLEAN NOT NULL DEFAULT TRUE
+        """))
+        # 迁移 id 列从 INTEGER 到 UUID（幂等：已为 UUID 则跳过）
+        session.execute(text("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'vocab_records'
+                      AND column_name = 'id'
+                      AND data_type = 'integer'
+                ) THEN
+                    ALTER TABLE vocab_records ALTER COLUMN id DROP DEFAULT;
+                    ALTER TABLE vocab_records ALTER COLUMN id SET DATA TYPE UUID USING gen_random_uuid();
+                    ALTER TABLE vocab_records ALTER COLUMN id SET DEFAULT gen_random_uuid();
+                    DROP SEQUENCE IF EXISTS vocab_records_id_seq;
+                END IF;
+            END
+            $$;
         """))
 
 
@@ -382,16 +403,21 @@ def is_pro(telegram_id: str) -> bool:
     return expires > datetime.now(timezone.utc)
 
 
-def get_today_add_count(telegram_id: str) -> int:
-    """统计该用户今天（UTC 日期）新增的词汇条数"""
+def get_today_add_count(
+    telegram_id: str, target_language: str | None = None
+) -> int:
+    """统计该用户今天（UTC 日期）新增的词汇条数，可按语言过滤"""
     today_start = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
     with _session() as session:
-        return session.query(func.count(VocabRecord.id)).filter(
+        query = session.query(func.count(VocabRecord.id)).filter(
             VocabRecord.telegram_id == telegram_id,
             VocabRecord.created_at >= today_start,
-        ).scalar() or 0
+        )
+        if target_language is not None:
+            query = query.filter(VocabRecord.target_language == target_language)
+        return query.scalar() or 0
 
 
 def activate_code(telegram_id: str, code: str) -> tuple[bool, str]:
@@ -520,14 +546,19 @@ def delete_vocab_by_native_language(telegram_id: str, native_language: str) -> i
         return len(rows)
 
 
-def get_level_distribution(telegram_id: str) -> dict[int, int]:
-    """返回各级别词汇数量 {level: count}"""
+def get_level_distribution(
+    telegram_id: str, target_language: str | None = None
+) -> dict[int, int]:
+    """返回各级别词汇数量 {level: count}，可按语言过滤"""
     with _session() as session:
-        rows = session.query(
+        query = session.query(
             VocabRecord.level, func.count(VocabRecord.id)
         ).filter(
             VocabRecord.telegram_id == telegram_id
-        ).group_by(VocabRecord.level).all()
+        )
+        if target_language is not None:
+            query = query.filter(VocabRecord.target_language == target_language)
+        rows = query.group_by(VocabRecord.level).all()
         return {lvl: cnt for lvl, cnt in rows}
 
 
@@ -642,6 +673,7 @@ def _default_settings() -> dict:
         "native_language": "zh",
         "active_language": "en",
         "learning_languages": ["en"],
+        "review_active_only": True,
         "proficiency_level": 0,
         "assessment_done": False,
     }
@@ -668,6 +700,7 @@ def get_user_settings(telegram_id: str) -> dict:
                 "native_language":    row.native_language,
                 "active_language":    row.active_language,
                 "learning_languages": row.learning_languages or ["en"],
+                "review_active_only": getattr(row, "review_active_only", True),
                 "proficiency_level":  getattr(row, "proficiency_level", 0) or 0,
                 "assessment_done":    getattr(row, "assessment_done", False) or False,
             }
@@ -765,6 +798,21 @@ def set_remind_enabled(telegram_id: str, enabled: bool) -> None:
             session.add(UserSettings(
                 telegram_id=telegram_id,
                 remind_enabled=enabled,
+            ))
+
+
+def set_review_active_only(telegram_id: str, enabled: bool) -> None:
+    """upsert review_active_only 字段，控制定时复习是仅推送当前语言还是全部语言"""
+    with _session() as session:
+        row = session.query(UserSettings).filter_by(
+            telegram_id=telegram_id
+        ).first()
+        if row:
+            row.review_active_only = enabled
+        else:
+            session.add(UserSettings(
+                telegram_id=telegram_id,
+                review_active_only=enabled,
             ))
 
 

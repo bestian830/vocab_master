@@ -84,7 +84,9 @@ async def vocab_confirm_keyboard(
         pos_part = f"  [{vocab.pos}]" if getattr(vocab, "pos", None) else ""
         btn_label = f"{add_label}  {vocab.word}{pos_part}"
         rows.append([InlineKeyboardButton(btn_label, callback_data=f"vc:add:{msg_id}:{i}")])
-    rows.append([InlineKeyboardButton(skip_label, callback_data=f"vc:skip:{msg_id}")])
+    # 单词只有 1 个时不显示跳过按钮（用户不点添加即可忽略）
+    if len(vocabs) > 1:
+        rows.append([InlineKeyboardButton(skip_label, callback_data=f"vc:skip:{msg_id}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -259,15 +261,21 @@ async def edit_field_keyboard(
 async def settings_panel_keyboard(
     toggle_label: str,
     lang: str = "zh",
+    review_scope_label: str = "",
 ) -> InlineKeyboardMarkup:
     """
-    通知设置主面板键盘：更改时段 + 开关推送
-    toggle_label: 已翻译的开关按钮文案（由调用方用 t_async 获取）
+    通知设置主面板键盘：更改时段 + 开关推送 + 复习范围
+    toggle_label: 已翻译的推送开关按钮文案
+    review_scope_label: 已翻译的复习范围切换按钮文案
     """
     window_label = await t_async("btn_change_window", lang)
     row1 = [InlineKeyboardButton(window_label, callback_data="settings:window")]
     row2 = [InlineKeyboardButton(toggle_label, callback_data="settings:toggle")]
-    return InlineKeyboardMarkup([row1, row2])
+    rows = [row1, row2]
+    if review_scope_label:
+        row3 = [InlineKeyboardButton(review_scope_label, callback_data="settings:toggle_review_scope")]
+        rows.append(row3)
+    return InlineKeyboardMarkup(rows)
 
 
 async def remind_window_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
