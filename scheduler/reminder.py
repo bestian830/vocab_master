@@ -94,13 +94,25 @@ async def _push_reviews(bot: Bot) -> None:
                 logger.debug("用户 %s 已关闭推送，跳过", telegram_id)
                 continue
 
+            # 读取用户母语，用于题目文案语言及干扰项语言
+            native_language = settings.get("native_language", "zh")
+
+            # 跳过母语词汇（母语不需要测试）
+            if target_language == native_language:
+                logger.debug("用户 %s 的 target_language=%s 与母语相同，跳过", telegram_id, target_language)
+                continue
+
+            # review_active_only 检查：仅推送当前激活语言
+            if settings.get("review_active_only", True):
+                active_language = settings.get("active_language", "en")
+                if target_language != active_language:
+                    logger.debug("用户 %s review_active_only=True，跳过非激活语言 %s", telegram_id, target_language)
+                    continue
+
             # 检查用户本地时间是否在提醒窗口内
             if not _is_in_remind_window(telegram_id):
                 logger.debug("用户 %s 不在提醒时间窗口内，跳过", telegram_id)
                 continue
-
-            # 读取用户母语，用于题目文案语言及干扰项语言
-            native_language = settings.get("native_language", "zh")
 
             # 生成对应语言的复习题（调度器无 context，禁用 generation 造句题）
             question = await build_quiz(
